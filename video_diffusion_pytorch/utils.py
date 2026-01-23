@@ -137,7 +137,6 @@ def generate_displacement_quiver_gif_comparison(
     )
     displacement_x1 = data1[0, 0]  # Shape: (20, 48, 48)
     displacement_y1 = data1[0, 1]  # Shape: (20, 48, 48)
-    displacement_y1 = -displacement_y1
 
     # Process field 2
     data2 = (
@@ -147,7 +146,6 @@ def generate_displacement_quiver_gif_comparison(
     )
     displacement_x2 = data2[0, 0]  # Shape: (20, 48, 48)
     displacement_y2 = data2[0, 1]  # Shape: (20, 48, 48)
-    displacement_y2 = -displacement_y2
 
     # Default titles if not provided
     if titles is None:
@@ -238,9 +236,6 @@ def generate_displacement_quiver_gif_predicted_reconstructed_gt(
     dx1, dy1 = data1[0, 0], data1[0, 1]
     dx2, dy2 = data2[0, 0], data2[0, 1]
     dx3, dy3 = data3[0, 0], data3[0, 1]
-    dy1 = -dy1
-    dy2 = -dy2
-    dy3 = -dy3
 
     num_frames, h, w = dx1.shape
     x, y = np.meshgrid(np.arange(w), np.arange(h))
