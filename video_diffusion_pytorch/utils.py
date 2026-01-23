@@ -17,7 +17,7 @@ def generate_displacement_quiver_gif(transformation_field, output_path, scale=1,
     Generates a GIF showing the displacement vectors across all frames without saving intermediate images.
 
     Parameters:
-    - transformation_field: displacement field (shape: (1, 2, 20, 64, 64)).
+    - transformation_field: displacement field (shape: (1, 2, 20, 48, 48)).
     - output_gif: Name of the output GIF file.
     - scale: Scaling factor for the quiver plot.
     - fps: Frames per second for the GIF.
@@ -27,8 +27,8 @@ def generate_displacement_quiver_gif(transformation_field, output_path, scale=1,
     )
 
     # Extract displacement components
-    displacement_x = data[0, 0]  # Shape: (20, 64, 64)
-    displacement_y = data[0, 1]  # Shape: (20, 64, 64)
+    displacement_x = data[0, 0]  # Shape: (20, 48, 48)
+    displacement_y = data[0, 1]  # Shape: (20, 48, 48)
 
     num_frames, h, w = displacement_x.shape
 
@@ -122,8 +122,8 @@ def generate_displacement_quiver_gif_comparison(
     Generates a GIF showing the displacement vectors for two fields side by side across all frames.
 
     Parameters:
-    - transformation_field1: First displacement field (shape: (1, 2, 20, 64, 64)).
-    - transformation_field2: Second displacement field (shape: (1, 2, 20, 64, 64)).
+    - transformation_field1: First displacement field (shape: (1, 2, 20, 48, 48)).
+    - transformation_field2: Second displacement field (shape: (1, 2, 20, 48, 48)).
     - output_path: Path for the output GIF file.
     - scale: Scaling factor for the quiver plots.
     - fps: Frames per second for the GIF.
@@ -135,8 +135,9 @@ def generate_displacement_quiver_gif_comparison(
         if isinstance(transformation_field1, torch.Tensor)
         else transformation_field1
     )
-    displacement_x1 = data1[0, 0]  # Shape: (20, 64, 64)
-    displacement_y1 = data1[0, 1]  # Shape: (20, 64, 64)
+    displacement_x1 = data1[0, 0]  # Shape: (20, 48, 48)
+    displacement_y1 = data1[0, 1]  # Shape: (20, 48, 48)
+    displacement_y1 = -displacement_y1
 
     # Process field 2
     data2 = (
@@ -144,8 +145,9 @@ def generate_displacement_quiver_gif_comparison(
         if isinstance(transformation_field2, torch.Tensor)
         else transformation_field2
     )
-    displacement_x2 = data2[0, 0]  # Shape: (20, 64, 64)
-    displacement_y2 = data2[0, 1]  # Shape: (20, 64, 64)
+    displacement_x2 = data2[0, 0]  # Shape: (20, 48, 48)
+    displacement_y2 = data2[0, 1]  # Shape: (20, 48, 48)
+    displacement_y2 = -displacement_y2
 
     # Default titles if not provided
     if titles is None:
@@ -236,6 +238,9 @@ def generate_displacement_quiver_gif_predicted_reconstructed_gt(
     dx1, dy1 = data1[0, 0], data1[0, 1]
     dx2, dy2 = data2[0, 0], data2[0, 1]
     dx3, dy3 = data3[0, 0], data3[0, 1]
+    dy1 = -dy1
+    dy2 = -dy2
+    dy3 = -dy3
 
     num_frames, h, w = dx1.shape
     x, y = np.meshgrid(np.arange(w), np.arange(h))
@@ -313,6 +318,7 @@ def generate_mask_disp_side_by_side_gif(
     # Extract displacement components
     displacement_x = field_data[0, 0]  # Shape: (F, H, W)
     displacement_y = field_data[0, 1]  # Shape: (F, H, W)
+    displacement_y = -displacement_y
 
     # Get dimensions
     _, num_frames, height, width = video_data.shape
@@ -338,6 +344,7 @@ def generate_mask_disp_side_by_side_gif(
             ax2.quiver(
                 x, y, displacement_x[frame_idx], displacement_y[frame_idx], color=quiver_color, scale=scale, units="xy"
             )
+            ax2.invert_yaxis()
             ax2.set_title(field_title)
             # ax2.axis('off')
 

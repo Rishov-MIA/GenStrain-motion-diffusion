@@ -8,7 +8,7 @@ import os
 
 
 # DATA BASE PATH
-base_path = "/scratch/vst2hb/video-diffusion-pytorch/new-data-sona-latest/all_data_resampled_20_frames-most-latest"
+base_path = "/scratch/vst2hb/video-diffusion-pytorch/new-data-sona-latest/all_data_resampled_20_frames-rv"
 
 # Define argument parser
 parser = argparse.ArgumentParser(description="Video Diffusion Pytorch Script")
