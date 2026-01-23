@@ -40,8 +40,8 @@ Expected layout (adapt as needed):
 
 Notes:
 
-- The dataset uses `.npy` files only and matches them one-to-one by sorted filename order.
-- `dense_mask` or `cine_mask` directory `.npy `files are expected to be shaped `[1, F, H, W]` where `F=20 `, `H=48 `, `W=48`
+- The dataset uses `.npy` files only and matches them one-to-one by sorted filename order. **All files of** `b` **,** `cine_mask` **and** `displacement_dense` **should have the same filenames.**
+- `dense_mask` or `cine_mask` directory `.npy `files are expected to be shaped `[1, F, H, W]` where `F=20`, `H=48`, `W=48`
 - **Mask videos are binary with values 0 and 255.0**; traininng and inference normalizes them to 0–1 by dividing by 255.0.
 - `displacement_dense` directory  `.npy` files should contain displacement fields shaped `[1, 2, F, H, W]`.
 
