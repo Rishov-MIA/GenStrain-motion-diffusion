@@ -85,4 +85,4 @@ Arguments:
 - `--video_type`: `cine`, `dense`, `paired_cine`, `paired_dense`
 - `--start`, `--end`: index range for videos in the contour/mask folder (optional)
 
-Outputs are saved to the folder defined by `custom_save_folder` in `inference.py`. Update that path as needed.
+Outputs are saved to `./<exp_name>/sampling_time_sampled_<video_type>_part_videos_infos/` and the folder is created automatically. Update `custom_save_folder` in `inference.py` if you want a different location.

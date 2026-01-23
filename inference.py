@@ -95,7 +95,8 @@ video_generator = pick_condition_videos_one_video_at_once(contour_cond_video_dir
 
 # Move to GPU if necessary
 device = next(trainer.ema_model.parameters()).device
-custom_save_folder = f"/scratch/vst2hb/video-diffusion-pytorch/{exp_name}/sampling_time_sampled_{video_type}_part_videos_infos/"
+custom_save_folder = f"./{exp_name}/sampling_time_sampled_{video_type}_part_videos_infos/"
+os.makedirs(custom_save_folder, exist_ok=True)
 
 
 for contour_cond_video, cond_filename in video_generator:
