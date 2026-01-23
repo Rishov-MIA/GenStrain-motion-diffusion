@@ -41,8 +41,8 @@ Expected layout (adapt as needed):
 Notes:
 
 - The dataset uses `.npy` files only and matches them one-to-one by sorted filename order.
-- The model expects 20 frames and 2 channels by default (see `train.py`), so your `.npy` arrays should match that.
-- Contour/mask `.npy` files are expected to be shaped `[1, F, H, W]` where `F=20`, `H=48`, `W=48`.
+- `dense_mask` or `cine_mask` directory `.npy `files are expected to be shaped `[1, F, H, W]` where `F=20 `, `H=48 `, `W=48`
+- `displacement_dense` directory  `.npy` files should contain displacement fields shaped `[1, 2, F, H, W]`.
 
 ## Training
 
