@@ -1,0 +1,16 @@
+conda create --name video-diffusion-env python=3.10 -y
+conda activate video-diffusion-env
+
+mamba install pytorch==2.0.0 torchvision==0.15.0 torchaudio==2.0.0 pytorch-cuda=11.8 -c pytorch -c nvidia -y
+
+pip install -r requirements.txt
+
+
+
+
+
+
+# downgrade (it is optional)
+# https://github.com/pytorch/pytorch/issues/123097
+mamba install mkl=2024.0.0 mkl-devel=2024.0.0 mkl-include=2024.0.0 -c conda-forge
+
