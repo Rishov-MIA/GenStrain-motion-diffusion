@@ -646,14 +646,18 @@ def extract_noise_mask_from_first_frame(mask):
     Since displacement is always relative to the first frame, the noise region
     is determined by frame 0 and broadcast across all frames.
 
+    Handles both 0-255 and 0-1 valued masks by binarizing with threshold 0.5.
+
     Args:
-        mask: tensor of shape [B, 1, F, H, W] with values in [0, 1]
+        mask: tensor of shape [B, 1, F, H, W] with values in [0, 1] or [0, 255]
 
     Returns:
         noise mask of shape [B, 1, F, H, W] (first frame repeated across all frames)
     """
     f = mask.shape[2]
     first_frame = mask[:, :, 0, :, :]  # [B, 1, H, W]
+    # Binarize: handles both 0-255 (threshold > 0.5) and 0-1 ranges
+    first_frame = (first_frame > 0.5).float()
     # Broadcast across all frames: [B, 1, F, H, W]
     return first_frame.unsqueeze(2).expand(-1, -1, f, -1, -1)
 
