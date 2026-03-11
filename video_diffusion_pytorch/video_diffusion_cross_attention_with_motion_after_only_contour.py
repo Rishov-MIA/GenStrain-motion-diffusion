@@ -639,6 +639,25 @@ def extract(a, t, x_shape):
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
 
+def extract_noise_mask_from_first_frame(mask):
+    """
+    Extract a spatial noise mask from the FIRST FRAME of the binary mask.
+
+    Since displacement is always relative to the first frame, the noise region
+    is determined by frame 0 and broadcast across all frames.
+
+    Args:
+        mask: tensor of shape [B, 1, F, H, W] with values in [0, 1]
+
+    Returns:
+        noise mask of shape [B, 1, F, H, W] (first frame repeated across all frames)
+    """
+    f = mask.shape[2]
+    first_frame = mask[:, :, 0, :, :]  # [B, 1, H, W]
+    # Broadcast across all frames: [B, 1, F, H, W]
+    return first_frame.unsqueeze(2).expand(-1, -1, f, -1, -1)
+
+
 def cosine_beta_schedule(timesteps, s=0.008):
     """
     cosine schedule
@@ -667,12 +686,14 @@ class GaussianDiffusion(nn.Module):
         dynamic_thres_percentile=0.9,
         global_means=None,
         global_stds=None,
+        contour_noise_only=False,
     ):
         super().__init__()
         self.channels = channels
         self.image_size = image_size
         self.num_frames = num_frames
         self.denoise_fn = denoise_fn
+        self.contour_noise_only = contour_noise_only
 
         betas = cosine_beta_schedule(timesteps)
 
@@ -788,12 +809,16 @@ class GaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance
 
     @torch.inference_mode()
-    def p_sample(self, x, t, cond=None, cond_scale=1.0, clip_denoised=True):
+    def p_sample(self, x, t, cond=None, cond_scale=1.0, clip_denoised=True, noise_mask=None):
         b, *_, device = *x.shape, x.device
         model_mean, _, model_log_variance = self.p_mean_variance(
             x=x, t=t, clip_denoised=clip_denoised, cond=cond, cond_scale=cond_scale
         )
         noise = torch.randn_like(x)
+
+        # Mask stochastic noise to contour region only
+        if noise_mask is not None:
+            noise = noise * noise_mask
 
         # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
@@ -806,9 +831,15 @@ class GaussianDiffusion(nn.Module):
         b = shape[0]
         img = torch.randn(shape, device=device)
 
+        # When contour_noise_only, compute noise mask and apply to initial noise
+        noise_mask = None
+        if self.contour_noise_only and cond is not None and isinstance(cond[0], torch.Tensor):
+            noise_mask = extract_noise_mask_from_first_frame(cond[0])  # [B, 1, F, H, W]
+            img = img * noise_mask  # start with noise only in contour region
+
         for i in tqdm(reversed(range(0, self.num_timesteps)), desc="sampling loop time step", total=self.num_timesteps):
             img = self.p_sample(
-                img, torch.full((b,), i, device=device, dtype=torch.long), cond=[cond[0]], cond_scale=cond_scale # only contour
+                img, torch.full((b,), i, device=device, dtype=torch.long), cond=[cond[0]], cond_scale=cond_scale, noise_mask=noise_mask
             )
 
         return unnormalize_divide_by_5(img)
@@ -846,8 +877,11 @@ class GaussianDiffusion(nn.Module):
 
         return img
 
-    def q_sample(self, x_start, t, noise=None):
+    def q_sample(self, x_start, t, noise=None, noise_mask=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
+
+        if noise_mask is not None:
+            noise = noise * noise_mask
 
         return (
             extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
@@ -858,6 +892,12 @@ class GaussianDiffusion(nn.Module):
         # cond: [contour_cond_video]
         b, c, f, h, w, device = *x_start.shape, x_start.device
         noise = default(noise, lambda: torch.randn_like(x_start))
+
+        # When contour_noise_only is enabled, mask noise using first frame of condition mask
+        noise_mask = None
+        if self.contour_noise_only and cond is not None and isinstance(cond[0], torch.Tensor):
+            noise_mask = extract_noise_mask_from_first_frame(cond[0])  # [B, 1, F, H, W]
+            noise = noise * noise_mask  # broadcasts to [B, 2, F, H, W]
 
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
         
