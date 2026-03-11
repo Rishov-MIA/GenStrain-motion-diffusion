@@ -923,12 +923,24 @@ class GaussianDiffusion(nn.Module):
         mse_disp = torch.mean((x_start - x0) ** 2)
         print(f"MSE disp in training: {mse_disp}")
 
-        if self.loss_type == "l1":
-            loss = F.l1_loss(noise, x_recon)
-        elif self.loss_type == "l2":
-            loss = F.mse_loss(noise, x_recon)
+        if self.contour_noise_only and noise_mask is not None:
+            # Compute loss only in the contour region
+            masked_noise = noise * noise_mask
+            masked_recon = x_recon * noise_mask
+            num_contour_pixels = noise_mask.sum().clamp(min=1.0)
+            if self.loss_type == "l1":
+                loss = (masked_noise - masked_recon).abs().sum() / num_contour_pixels
+            elif self.loss_type == "l2":
+                loss = ((masked_noise - masked_recon) ** 2).sum() / num_contour_pixels
+            else:
+                raise NotImplementedError()
         else:
-            raise NotImplementedError()
+            if self.loss_type == "l1":
+                loss = F.l1_loss(noise, x_recon)
+            elif self.loss_type == "l2":
+                loss = F.mse_loss(noise, x_recon)
+            else:
+                raise NotImplementedError()
 
         return loss, unnormalize_divide_by_5(x0), unnormalize_divide_by_5(x_start)
         
