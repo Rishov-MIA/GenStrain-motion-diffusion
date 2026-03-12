@@ -826,7 +826,13 @@ class GaussianDiffusion(nn.Module):
 
         # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
-        return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
+        result = model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
+
+        # Zero out non-contour pixels to prevent unconstrained predictions from accumulating
+        if noise_mask is not None:
+            result = result * noise_mask
+
+        return result
 
     @torch.inference_mode()
     def p_sample_loop(self, shape, cond=None, cond_scale=1.0):
@@ -904,7 +910,12 @@ class GaussianDiffusion(nn.Module):
             noise = noise * noise_mask  # broadcasts to [B, 2, F, H, W]
 
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        
+
+        # Zero out non-contour pixels in x_noisy so the model always sees zeros
+        # outside the contour — matching what it sees during inference
+        if noise_mask is not None:
+            x_noisy = x_noisy * noise_mask
+
         # add encoder here
         if is_list_str(cond):
             cond = bert_embed(tokenize(cond), return_cls_repr=self.text_use_bert_cls)  # (3, 768) => (B, embedding_size)
