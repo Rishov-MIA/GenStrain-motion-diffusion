@@ -51,9 +51,9 @@ def pick_condition_videos_one_video_at_once(contour_cond_video_dir, motion_cond_
 
         motion_cond_video_path = motion_cond_video_dir / cond_filename
         motion_cond = np.load(motion_cond_video_path)
-        motion_cond_tensor = torch.from_numpy(motion_cond).float()  # shape [1, F, H, W]
+        motion_cond_tensor = torch.from_numpy(motion_cond).float()  # shape [1, 2, F, H, W] — batch dim already included
 
-        yield contour_cond_tensor.unsqueeze(0), motion_cond_tensor.unsqueeze(0), [cond_filename]
+        yield contour_cond_tensor.unsqueeze(0), motion_cond_tensor, [cond_filename]
 
 
 model = Unet3D(
