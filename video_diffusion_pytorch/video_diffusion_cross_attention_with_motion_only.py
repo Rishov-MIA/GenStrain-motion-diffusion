@@ -262,6 +262,7 @@ class SpatialLinearAttention(nn.Module):
         self.scale = dim_head**-0.5
         self.heads = heads
         hidden_dim = dim_head * heads
+        # self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)
         self.to_q = nn.Conv2d(dim, hidden_dim, 1, bias=False)
         self.to_kv = nn.Conv2d(dim, hidden_dim * 2, 1, bias=False)
         self.to_out = nn.Conv2d(hidden_dim, dim, 1)
@@ -274,6 +275,7 @@ class SpatialLinearAttention(nn.Module):
         q = self.to_q(x[0])
         kv = self.to_kv(x[1]).chunk(2, dim=1)
         qkv = (q, kv[0], kv[1])
+        # qkv = self.to_qkv(x).chunk(3, dim=1)
         q, k, v = rearrange_many(qkv, "b (h c) x y -> b h c (x y)", h=self.heads)
 
         q = q.softmax(dim=-2)
@@ -316,6 +318,7 @@ class Attention(nn.Module):
         hidden_dim = dim_head * heads
 
         self.rotary_emb = rotary_emb
+        # self.to_q = nn.Linear(dim, hidden_dim * 3, bias=False)
         self.to_q = nn.Linear(dim, hidden_dim, bias=False)
         self.to_kv = nn.Linear(dim, hidden_dim * 2, bias=False)
         self.to_out = nn.Linear(hidden_dim, dim, bias=False)
@@ -327,18 +330,31 @@ class Attention(nn.Module):
         qkv = (q, kv[0], kv[1])
 
         if exists(focus_present_mask) and focus_present_mask.all():
+            # if all batch samples are focusing on present
+            # it would be equivalent to passing that token's values through to the output
             values = qkv[-1]
             return self.to_out(values)
 
+        # split out heads
         q, k, v = rearrange_many(qkv, "... n (h d) -> ... h n d", h=self.heads)
 
+        # q, k, v = rearrange(q, '... n (h d) -> ... h n d', h = self.heads), rearrange(k, '... n (h d) -> ... h n d', h = self.heads), rearrange(v, '... n (h d) -> ... h n d', h = self.heads)
+
+        # scale
+
         q = q * self.scale
+
+        # rotate positions into queries and keys for time attention
 
         if exists(self.rotary_emb):
             q = self.rotary_emb.rotate_queries_or_keys(q)
             k = self.rotary_emb.rotate_queries_or_keys(k)
 
+        # similarity
+
         sim = einsum("... h i d, ... h j d -> ... h i j", q, k)
+
+        # relative positional bias
 
         if exists(pos_bias):
             sim = sim + pos_bias
@@ -355,8 +371,12 @@ class Attention(nn.Module):
 
             sim = sim.masked_fill(~mask, -torch.finfo(sim.dtype).max)
 
+        # numerical stability
+
         sim = sim - sim.amax(dim=-1, keepdim=True).detach()
         attn = sim.softmax(dim=-1)
+
+        # aggregate values
 
         out = einsum("... h i j, ... h j d -> ... h i d", attn, v)
         out = rearrange(out, "... h n d -> ... n (h d)")
@@ -394,13 +414,17 @@ class Unet3D(nn.Module):
         super().__init__()
         self.channels = channels
 
+        # temporal attention and its relative positional encoding
+
         rotary_emb = RotaryEmbedding(min(32, attn_dim_head))
 
         temporal_attn = lambda dim: EinopsToAndFrom(
             "b c f h w", "b (h w) f c", Attention(dim, heads=attn_heads, dim_head=attn_dim_head, rotary_emb=rotary_emb)
         )
 
-        self.time_rel_pos_bias = RelativePositionBias(heads=attn_heads, max_distance=32)
+        self.time_rel_pos_bias = RelativePositionBias(
+            heads=attn_heads, max_distance=32
+        )  # realistically will not be able to generate that many frames of video... yet
 
         # initial conv
 
@@ -444,10 +468,13 @@ class Unet3D(nn.Module):
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
 
+        # choose the block class
         block_klass = ResnetBlock
 
         self.downs = nn.ModuleList([])
         self.ups = nn.ModuleList([])
+
+        # modules for all layers
 
         for idx, (dim_in, dim_out) in enumerate(in_out):
             is_last = idx >= len(in_out) - 1
@@ -516,7 +543,7 @@ class Unet3D(nn.Module):
         cond=None,  # cond = [motion_cond_video]  shape [B, 2, F, H, W]
         null_cond_prob=0.0,
         focus_present_mask=None,
-        prob_focus_present=0.0,
+        prob_focus_present=0.0,  # probability at which a given batch sample will focus on the present (0. is all off, 1. is completely arrested attention across time)
     ):
         assert not (self.has_cond and not exists(cond)), "cond must be passed in if cond_dim specified"
         batch, device = x.shape[0], x.device
@@ -528,8 +555,10 @@ class Unet3D(nn.Module):
         time_rel_pos_bias = self.time_rel_pos_bias(x.shape[2], device=x.device)
 
         x = self.init_conv(x)
+        # needed for if self.has_cond:
+        # cond_original = cond.clone()
 
-        motion_cond = cond[0]  # [B, 2, F, H, W]
+        motion_cond = cond[0]
         motion_cond = self.init_conv_motion_cond(motion_cond)
 
         x = self.init_temporal_attn([x, motion_cond], x, pos_bias=time_rel_pos_bias)
@@ -538,10 +567,20 @@ class Unet3D(nn.Module):
 
         t = self.time_mlp(time) if exists(self.time_mlp) else None
 
+        # classifier free guidance
+
         if self.has_cond:
             print("dont come here")
+            # encoder = ConditionVideoEncoder(in_channels=1) # condition video has 1 channel
+            # encoded_cond = encoder(cond_original)
+            # batch, device = x.shape[0], x.device
+            # mask = prob_mask_like((batch,), null_cond_prob, device = device)
+            # encoded_cond = torch.where(rearrange(mask, 'b -> b 1'), self.null_cond_emb, encoded_cond)
+            # # time + cond embedding concatenate
+            # t = torch.cat((t, encoded_cond), dim = -1)
 
         h = []
+        # count = 0
         for block1, block2, cond_conv_1, cond_conv_2, spatial_attn, temporal_attn, downsample in self.downs:
             x = block1(x, t)
             x = block2(x, t)
@@ -580,7 +619,6 @@ class Unet3D(nn.Module):
             x = temporal_attn([x, motion_cond], x, pos_bias=time_rel_pos_bias, focus_present_mask=focus_present_mask)
 
             x = upsample(x)
-
             motion_cond = upsample(motion_cond)
 
         x = torch.cat((x, r), dim=1)
@@ -597,6 +635,10 @@ def extract(a, t, x_shape):
 
 
 def cosine_beta_schedule(timesteps, s=0.008):
+    """
+    cosine schedule
+    as proposed in https://openreview.net/forum?id=-NEXDKk8gZ
+    """
     steps = timesteps + 1
     x = torch.linspace(0, timesteps, steps, dtype=torch.float64)
     alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
@@ -616,7 +658,7 @@ class GaussianDiffusion(nn.Module):
         channels=3,
         timesteps=1000,
         loss_type="l1",
-        use_dynamic_thres=False,
+        use_dynamic_thres=False,  # from the Imagen paper
         dynamic_thres_percentile=0.9,
         global_means=None,
         global_stds=None,
@@ -637,11 +679,15 @@ class GaussianDiffusion(nn.Module):
         self.num_timesteps = int(timesteps)
         self.loss_type = loss_type
 
+        # register buffer helper function that casts float64 to float32
+
         register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32))
 
         register_buffer("betas", betas)
         register_buffer("alphas_cumprod", alphas_cumprod)
         register_buffer("alphas_cumprod_prev", alphas_cumprod_prev)
+
+        # calculations for diffusion q(x_t | x_{t-1}) and others
 
         register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod))
         register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod))
@@ -649,32 +695,50 @@ class GaussianDiffusion(nn.Module):
         register_buffer("sqrt_recip_alphas_cumprod", torch.sqrt(1.0 / alphas_cumprod))
         register_buffer("sqrt_recipm1_alphas_cumprod", torch.sqrt(1.0 / alphas_cumprod - 1))
 
+        # calculations for posterior q(x_{t-1} | x_t, x_0)
+
         posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
 
+        # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
+
         register_buffer("posterior_variance", posterior_variance)
+
+        # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
+
         register_buffer("posterior_log_variance_clipped", torch.log(posterior_variance.clamp(min=1e-20)))
         register_buffer("posterior_mean_coef1", betas * torch.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod))
         register_buffer(
             "posterior_mean_coef2", (1.0 - alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - alphas_cumprod)
         )
 
+        # ------------ Store global_means, global_stds as buffers ------------
         if global_means is None:
+            # By default, zero means (one per channel)
             global_means = torch.zeros(channels, dtype=torch.float32)
         else:
+            # Ensure it's a tensor
             global_means = torch.as_tensor(global_means, dtype=torch.float32)
 
         if global_stds is None:
+            # By default, ones for std (one per channel)
             global_stds = torch.ones(channels, dtype=torch.float32)
         else:
             global_stds = torch.as_tensor(global_stds, dtype=torch.float32)
 
-        assert global_means.shape[0] == channels
-        assert global_stds.shape[0] == channels
+        # Optional: check shape
+        assert global_means.shape[0] == channels, f"global_means must have shape [channels], got {global_means.shape}"
+        assert global_stds.shape[0] == channels, f"global_stds must have shape [channels], got {global_stds.shape}"
 
+        # Register them
         register_buffer("global_means", global_means)
         register_buffer("global_stds", global_stds)
 
+        # text conditioning parameters
+
         self.text_use_bert_cls = text_use_bert_cls
+
+        # dynamic thresholding when sampling
+
         self.use_dynamic_thres = use_dynamic_thres
         self.dynamic_thres_percentile = dynamic_thres_percentile
 
@@ -703,13 +767,18 @@ class GaussianDiffusion(nn.Module):
         x_recon = self.predict_start_from_noise(
             x, t=t, noise=self.denoise_fn.forward_with_cond_scale(x, t, cond=cond, cond_scale=cond_scale)
         )
+        # print(f"max: {x_recon.max()}    min: {x_recon.min()}")
 
         if clip_denoised:
             s = 1.0
             if self.use_dynamic_thres:
                 s = torch.quantile(rearrange(x_recon, "b ... -> b (...)").abs(), self.dynamic_thres_percentile, dim=-1)
+
                 s.clamp_(min=1.0)
                 s = s.view(-1, *((1,) * (x_recon.ndim - 1)))
+
+            # clip by threshold, depending on whether static or dynamic
+            # x_recon = x_recon.clamp(-s, s) / s
 
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_recon, x_t=x, t=t)
         return model_mean, posterior_variance, posterior_log_variance
@@ -721,6 +790,8 @@ class GaussianDiffusion(nn.Module):
             x=x, t=t, clip_denoised=clip_denoised, cond=cond, cond_scale=cond_scale
         )
         noise = torch.randn_like(x)
+
+        # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
 
@@ -733,7 +804,7 @@ class GaussianDiffusion(nn.Module):
 
         for i in tqdm(reversed(range(0, self.num_timesteps)), desc="sampling loop time step", total=self.num_timesteps):
             img = self.p_sample(
-                img, torch.full((b,), i, device=device, dtype=torch.long), cond=[cond[0]], cond_scale=cond_scale
+                img, torch.full((b,), i, device=device, dtype=torch.long), cond=cond, cond_scale=cond_scale
             )
 
         return unnormalize_divide_by_5(img)
@@ -744,7 +815,7 @@ class GaussianDiffusion(nn.Module):
 
         if is_list_str(cond):
             cond = bert_embed(tokenize(cond)).to(device)
-        elif len(cond) == 1 and isinstance(cond[0], torch.Tensor):
+        elif len(cond) == 1 and isinstance(cond[0], torch.Tensor):  # video
             motion_cond_video = cond[0].to(device)
 
         batch_size = motion_cond_video.shape[0]
@@ -755,28 +826,48 @@ class GaussianDiffusion(nn.Module):
             (batch_size, channels, num_frames, image_size, image_size), cond=[motion_cond_video], cond_scale=cond_scale
         )
 
+    @torch.inference_mode()
+    def interpolate(self, x1, x2, t=None, lam=0.5):
+        b, *_, device = *x1.shape, x1.device
+        t = default(t, self.num_timesteps - 1)
+
+        assert x1.shape == x2.shape
+
+        t_batched = torch.stack([torch.tensor(t, device=device)] * b)
+        xt1, xt2 = map(lambda x: self.q_sample(x, t=t_batched), (x1, x2))
+
+        img = (1 - lam) * xt1 + lam * xt2
+        for i in tqdm(reversed(range(0, t)), desc="interpolation sample time step", total=t):
+            img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long))
+
+        return img
+
     def q_sample(self, x_start, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
+
         return (
             extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
             + extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
     def p_losses(self, x_start, t, cond=None, noise=None, **kwargs):
-        # cond: [motion_cond_video]  shape [B, 2, F, H, W]
+        # cond: [motion_cond_video]
         b, c, f, h, w, device = *x_start.shape, x_start.device
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
+        # add encoder here
         if is_list_str(cond):
-            cond = bert_embed(tokenize(cond), return_cls_repr=self.text_use_bert_cls)
+            cond = bert_embed(tokenize(cond), return_cls_repr=self.text_use_bert_cls)  # (3, 768) => (B, embedding_size)
             cond = cond.to(device)
-        elif len(cond) == 1 and isinstance(cond[0], torch.Tensor):
+        elif len(cond) == 1 and isinstance(cond[0], torch.Tensor):  # video
             motion_cond_video = cond[0].to(device)
 
-        x_recon = self.denoise_fn(x_noisy, t, cond=[motion_cond_video], **kwargs)
+        x_recon = self.denoise_fn(x_noisy, t, cond=[motion_cond_video], **kwargs) 
 
+        # epsilon given. extract x0
+        # forward x0 print from predicted noise x_recon
         x0 = self.predict_start_from_noise(x_noisy, t=t, noise=x_recon)
 
         mse_disp = torch.mean((x_start - x0) ** 2)
@@ -790,9 +881,9 @@ class GaussianDiffusion(nn.Module):
             raise NotImplementedError()
 
         return loss, unnormalize_divide_by_5(x0), unnormalize_divide_by_5(x_start)
-
+        
     def forward(self, x, cond=None, *args, **kwargs):
-        # cond type: [motion_cond_video]  shape [B, 2, F, H, W]
+        # cond type: [motion_cond_video]
         (
             b,
             device,
@@ -804,10 +895,75 @@ class GaussianDiffusion(nn.Module):
         )
         check_shape(x, "b c f h w", c=self.channels, f=self.num_frames, h=img_size, w=img_size)
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
-
+        
         x = normalize_divide_by_5(x)
         motion_cond_video = normalize_divide_by_5(cond[0])
         return self.p_losses(x, t, cond=[motion_cond_video], **kwargs)
+    
+    
+    @torch.inference_mode()
+    def forward_diffuse_single(
+        self,
+        x_start: torch.Tensor,
+        t: int | torch.Tensor,
+        *,
+        noise: torch.Tensor | None = None,
+        normalize_input: bool = True,
+        return_noise: bool = True
+    ):
+        """
+        Run the forward diffusion q(x_t | x_0) for a single sample at timestep t.
+
+        Args:
+            x_start: Tensor of shape (C, F, H, W) or (1, C, F, H, W) in your *unnormalized* scale
+                    (i.e., pre normalize_divide_by_5). If normalize_input=False, it is assumed
+                    already normalized like in `forward()`.
+            t:       Integer timestep in [0, self.num_timesteps-1] or a 0/1-D tensor.
+            noise:   Optional noise tensor of same shape as x_start (after adding batch dim).
+                    If None, uses standard Gaussian.
+            normalize_input: If True, applies `normalize_divide_by_5` to x_start before diffusion.
+            return_noise: If True, also returns the noise actually used.
+
+        Returns:
+            x_t:  Tensor of shape (1, C, F, H, W)
+            noise (optional): The exact noise used, same shape as x_t
+        """
+        # ensure batch dimension
+        if x_start.dim() == 4:
+            x_start = x_start.unsqueeze(0)  # (1, C, F, H, W)
+        elif x_start.dim() != 5 or x_start.shape[0] != 1:
+            raise ValueError("x_start must be (C, F, H, W) or (1, C, F, H, W) for a single sample")
+
+        device = self.betas.device
+        x_start = x_start.to(device)
+
+        # match normalization used in training
+        if normalize_input:
+            x_start = normalize_divide_by_5(x_start)
+
+        # timestep as a (1,) long tensor on correct device
+        if isinstance(t, int):
+            t = torch.tensor([t], device=device, dtype=torch.long)
+        else:
+            t = t.to(device).long().reshape(1)
+
+        # noise
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        else:
+            noise = noise.to(device)
+            if noise.shape != x_start.shape:
+                raise ValueError(f"noise must have shape {x_start.shape}, got {noise.shape}")
+
+        # q(x_t | x_0)
+        x_t = self.q_sample(x_start=x_start, t=t, noise=noise)
+
+        # return in normalized space (like q_sample outputs).
+        # If you prefer to get it back in the original scale, uncomment:
+        # x_t = unnormalize_divide_by_5(x_t)
+
+        return (x_t, noise) if return_noise else x_t
+
 
 
 # trainer class
@@ -824,12 +980,25 @@ def unnormalize_divide_by_5(x: torch.Tensor) -> torch.Tensor:
     return x * 5.0
 
 
+def normalize_channelwise(x: torch.Tensor) -> torch.Tensor:
+    """
+    Normalize a 5D tensor (b, c, f, h, w) channel-wise into [-1, 1].
+    """
+    x = x.float()
+    mins = x.amin(dim=(0, 2, 3, 4), keepdim=True)
+    maxs = x.amax(dim=(0, 2, 3, 4), keepdim=True)
+    eps = 1e-8
+    denom = (maxs - mins).clamp(min=eps)
+    x_normalized = 2.0 * (x - mins) / denom - 1.0
+    return x_normalized
+
+
 def normalize_cond_img(t):
     return t / 255.0
 
 
 def unnormalize_img(t):
-    return x * 5.0
+    return t * 5.0
 
 
 def cast_num_frames(t, *, frames):
@@ -850,11 +1019,11 @@ class Dataset(data.Dataset):
         input_video_folder,
         image_size,
         motion_condition_video_dir,
-        channels=2,
+        channels=2,  # input video has 2 channels
         num_frames=16,
         horizontal_flip=False,
         force_num_frames=True,
-        exts=["npy"],
+        exts=["npy"],  # both video as .npy format
     ):
         super().__init__()
         self.input_video_folder = input_video_folder
@@ -876,10 +1045,14 @@ class Dataset(data.Dataset):
             motion_condition_video_paths
         ), "Number of target and motion conditioning videos must match"
 
-        for input_path, motion_condition_path in zip(input_video_paths, motion_condition_video_paths):
+        for input_path, motion_condition_path in zip(
+            input_video_paths, motion_condition_video_paths
+        ):
             self.video_pairs.append((input_path, motion_condition_path))
-
+        
+        # Cache initialization
         self.cache = {}
+
 
     def __len__(self):
         return len(self.video_pairs)
@@ -887,23 +1060,31 @@ class Dataset(data.Dataset):
     def __getitem__(self, index):
         input_video_path, motion_condition_video_path = self.video_pairs[index]
 
+        # Lazy loading and caching: Load the video data only once, then cache it for future use
         if index not in self.cache:
+            # Load input video data
             input_video_tensor = torch.from_numpy(np.load(input_video_path)).float()
             motion_condition_video_tensor = torch.from_numpy(np.load(motion_condition_video_path)).float()
+
+            # Cache the data
             self.cache[index] = (input_video_tensor, motion_condition_video_tensor)
         else:
+            # Retrieve from cache
             input_video_tensor, motion_condition_video_tensor = self.cache[index]
 
+        # Optionally, you can apply any transformations here (like resizing, normalization, etc.)
+        # For now, return the tensors directly
         return (
-            input_video_tensor.squeeze(0),
-            motion_condition_video_tensor.squeeze(0),  # [1, 2, F, H, W] -> [2, F, H, W]
+            input_video_tensor.squeeze(0),  # Remove extra dimension
+            motion_condition_video_tensor.squeeze(0),  # Remove extra dimension
         )
 
-
 def random_pick_condition_videos(num_samples, motion_cond_video_dir):
+    # Convert string to a Path object
     motion_cond_video_dir = Path(motion_cond_video_dir)
     motion_cond_video_paths = sorted(list(motion_cond_video_dir.glob("*.npy")))
 
+    # Select random indices
     num_samples = min(num_samples, len(motion_cond_video_paths))
     indices = random.sample(range(len(motion_cond_video_paths)), num_samples)
 
@@ -913,9 +1094,10 @@ def random_pick_condition_videos(num_samples, motion_cond_video_dir):
     for idx in indices:
         motion_cond_video_path = motion_cond_video_paths[idx]
         motion_cond = np.load(motion_cond_video_path)
-        motion_cond_tensor = torch.from_numpy(motion_cond).float()  # shape [2, F, H, W]
-        motion_cond_tensors.append(motion_cond_tensor.unsqueeze(0))  # [1, 2, F, H, W]
-        filenames.append(f"{motion_cond_video_path.stem}.npy")
+        motion_cond_tensor = torch.from_numpy(motion_cond).float()  # shape [1, 2, F, H, W]
+        motion_cond_tensors.append(motion_cond_tensor)  # add batch dim => [batch, 2, F, H, W]
+
+        filenames.append(f"{motion_cond_video_path.stem}.npy")  # store the base filename, e.g. "my_video"
 
     motion_cond_tensors = torch.cat(motion_cond_tensors, dim=0)
 
@@ -928,8 +1110,8 @@ class Trainer(object):
         diffusion_model,
         input_video_folder,
         *,
-        motion_condition_video_dir=None,
-        sampling_motion_condition_video_dir=None,
+        motion_condition_video_dir=None,  # folder with motion condition dense videos for training
+        sampling_motion_condition_video_dir=None,  # folder with motion condition cine videos for sampling
         ema_decay=0.995,
         num_frames=16,
         train_batch_size=32,
@@ -971,7 +1153,7 @@ class Trainer(object):
         )
 
         print(f"found {len(self.ds)} videos as .npy files at {input_video_folder}")
-        assert len(self.ds) > 0, "need to have at least 1 video to start training"
+        assert len(self.ds) > 0, "need to have at least 1 video to start training (although 1 is not great, try 100k)"
 
         self.dl = cycle(data.DataLoader(self.ds, batch_size=train_batch_size, shuffle=True, pin_memory=True))
         self.opt = Adam(diffusion_model.parameters(), lr=train_lr)
@@ -1059,6 +1241,7 @@ class Trainer(object):
             if self.step % self.update_ema_every == 0:
                 self.step_ema()
 
+            # Save recontructed x0 every 300 steps (customize as needed)
             if (self.step % 300 == 0) and (self.step != 0):
                 predicted_start_training_dir = f"./{self.experiment_name}/predicted_start_training_gifs"
                 os.makedirs(predicted_start_training_dir, exist_ok=True)
@@ -1081,11 +1264,14 @@ class Trainer(object):
                     num_samples=1,
                     motion_cond_video_dir=self.sampling_motion_condition_video_dir,
                 )
+                # normalize cine contour condition image here
                 sample_motion_cond = normalize_divide_by_5(sample_motion_cond)
 
+                # If your training set is on CPU, move to GPU:
                 device = next(self.ema_model.parameters()).device
                 sample_motion_cond = sample_motion_cond.to(device)
 
+                # sample a grid
                 self.sample_and_save(
                     milestone,
                     motion_cond_video=sample_motion_cond,
@@ -1107,38 +1293,47 @@ class Trainer(object):
         cond_scale=2.0,
         save_folder="./sampled_videos_infos",
     ):
+        # Number of samples to generate
+        # motion_cond_video shape [num_samples, 2, F, H, W]
         num_samples = motion_cond_video.shape[0]
 
         sampled_videos = self.ema_model.sample(cond=[motion_cond_video], cond_scale=cond_scale, batch_size=num_samples)
-        sampled_videos = sampled_videos.cpu().numpy()
-        sampled_videos = np.expand_dims(sampled_videos, axis=1)
+        sampled_videos = sampled_videos.cpu().numpy() # [num_samples, 2, F, H, W]
+        sampled_videos = np.expand_dims(sampled_videos, axis=1) # [num_samples, 1, 2, F, H, W]
 
         save_folder = Path(save_folder)
         save_folder.mkdir(exist_ok=True, parents=True)
 
+        # Create subdirectories for ground truths and sampled videos
         sampled_folder = save_folder / "inference_disps"
         sampled_folder.mkdir(exist_ok=True, parents=True)
 
+        # Instead of saving one big file, loop over each sample
         for i in range(num_samples):
+            # If cond_filenames is None or too short, just name it generically
             if cond_filenames is not None and i < len(cond_filenames):
                 base_name = cond_filenames[i]
             else:
                 base_name = f"sample_{i:03d}"
 
-            sampled_disp_single = sampled_videos[i]
+            sampled_disp_single = sampled_videos[i]  # shape [1, 2, F, H, W]
+
+            # Build the output filenames
             sampled_disp_path = sampled_folder / f"{base_name}"
             np.save(sampled_disp_path, sampled_disp_single)
 
         output_gif_dir = f"{save_folder}/quiver_plots"
+        # Create output directory if needed
         output_dir = Path(output_gif_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        generate_displacement_quiver_gifs(
-            milestone,
-            sampled_videos,
-            cond_filenames,
-            output_dir=output_gif_dir,
+        generate_displacement_quiver_gif_comparison(
+            motion_cond_video,
+            sampled_disp_single,
+            output_path=f"{output_gif_dir}/milestone_{milestone}_{cond_filenames[0].split('.npy')[0]}.gif",
+            titles=["motion condition", "Predicted"]
         )
+        
 
     @torch.inference_mode()
     def sample_and_save_one_video_at_a_time(
@@ -1151,39 +1346,44 @@ class Trainer(object):
         cond_scale=2.0,
         save_folder="./sampled_videos_infos",
     ):
-        # motion_cond_video shape: [B, 2, F, H, W]
+        # Number of samples to generate
+        # motion_cond_video shape [num_samples, 1, 2, F, H, W]
         num_samples = motion_cond_video.shape[0]
 
         sampled_videos = self.ema_model.sample(cond=[motion_cond_video], cond_scale=cond_scale, batch_size=num_samples)
-        sampled_videos = sampled_videos.cpu().numpy()
-        sampled_videos = np.expand_dims(sampled_videos, axis=1)
+        sampled_videos = sampled_videos.cpu().numpy() # [num_samples, 2, F, H, W]
+        sampled_videos = np.expand_dims(sampled_videos, axis=1) # [num_samples, 1, 2, F, H, W]
 
         save_folder = Path(save_folder)
         save_folder.mkdir(exist_ok=True, parents=True)
 
+        # Create subdirectories for ground truths and sampled videos
         sampled_folder = save_folder / "inference_disps"
         sampled_folder.mkdir(exist_ok=True, parents=True)
 
         output_gif_dir = f"{save_folder}/quiver_plots"
+        # Create output directory if needed
         output_dir = Path(output_gif_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Instead of saving one big file, loop over each sample
         for i in range(num_samples):
+            # If cond_filenames is None or too short, just name it generically
             if cond_filenames is not None and i < len(cond_filenames):
                 base_name = cond_filenames[i]
             else:
                 base_name = f"sample_{i:03d}"
 
-            sampled_disp_single = sampled_videos[i]
+            sampled_disp_single = sampled_videos[i]  # shape [1, 2, F, H, W]
 
+            # Build the output filenames
             sampled_disp_path = sampled_folder / f"{base_name}"
             np.save(sampled_disp_path, sampled_disp_single)
 
-            if reconstructed_disp is None and gt_disp is None:
-                generate_displacement_quiver_gifs(milestone, np.expand_dims(sampled_disp_single, axis=0), [base_name], output_dir=output_gif_dir)
-            elif reconstructed_disp is None and gt_disp is not None:
-                generate_displacement_quiver_gif_comparison(sampled_disp_single, gt_disp, output_path=f"{output_gif_dir}/{cond_filenames[0].split('.npy')[0]}.gif", titles=["Predicted", "Ground Truth"])
-            elif reconstructed_disp is not None and gt_disp is None:
-                generate_displacement_quiver_gif_comparison(sampled_disp_single, reconstructed_disp, output_path=f"{output_gif_dir}/{cond_filenames[0].split('.npy')[0]}.gif", titles=["Predicted", "Reconstructed"])
-            else:
-                generate_displacement_quiver_gif_predicted_reconstructed_gt(sampled_disp_single, reconstructed_disp, gt_disp, output_path=f"{output_gif_dir}/{cond_filenames[0].split('.npy')[0]}.gif")
+            if reconstructed_disp is None and gt_disp is not None:
+                generate_displacement_quiver_gif_comparison(
+                    sampled_disp_single,
+                    gt_disp,
+                    output_path=f"{output_gif_dir}/{cond_filenames[0].split('.npy')[0]}.gif",
+                    titles=["Predicted", "Ground Truth"]
+                )
