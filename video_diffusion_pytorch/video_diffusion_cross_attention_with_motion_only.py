@@ -896,7 +896,7 @@ class Dataset(data.Dataset):
 
         return (
             input_video_tensor.squeeze(0),
-            motion_condition_video_tensor,
+            motion_condition_video_tensor.squeeze(0),  # [1, 2, F, H, W] -> [2, F, H, W]
         )
 
 
