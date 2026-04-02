@@ -1,5 +1,5 @@
 import torch
-from video_diffusion_pytorch.video_diffusion_cross_attention_with_both_contour_motion import Unet3D, GaussianDiffusion, Trainer
+from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_after_only_contour import Unet3D, GaussianDiffusion, Trainer
 
 
 # DATA BASE PATH
@@ -20,23 +20,20 @@ diffusion = GaussianDiffusion(
     num_frames = 20,
     timesteps = 1000,   # number of steps
     loss_type = 'l2',   # L1 or L2
-    contour_noise_only = True,  # True = noise only in mask contour region, False = noise on full image
+    contour_noise_only = False,  # True = noise only in mask contour region, False = noise on full image
 ).cuda()
 
-# exp_name = "noise-contour-region-cond-mask-motion-both"
-exp_name = "new-data-noise-contour-region-cond-mask-motion-both"
+exp_name = "new-data-noise-full-region-cond-mask-only"
 
 
 trainer = Trainer(
     diffusion_model=diffusion,
     input_video_folder=f'{base_path}/dense/train/displacement_dense',
     contour_condition_video_dir=f'{base_path}/dense/train/dense_mask',
-    motion_condition_video_dir=f'{base_path}/tlrn_dense_mask_motion/train',
     sampling_contour_condition_video_dir=f'{base_path}/dense/test/dense_mask',
-    sampling_motion_condition_video_dir=f'{base_path}/tlrn_dense_mask_motion/test',
     train_batch_size = 20,
     train_lr = 1e-5,
-    save_and_sample_every = 500,
+    save_and_sample_every = 300,
     train_num_steps = 700000,         # total training steps
     gradient_accumulate_every = 1,    # gradient accumulation steps
     ema_decay = 0.995,                # exponential moving average decay

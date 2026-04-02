@@ -68,11 +68,11 @@ diffusion = GaussianDiffusion(
     num_frames = 20,
     timesteps = 1000,   # number of steps
     loss_type = 'l2',   # L1 or L2
-    contour_noise_only = True,  # True = noise only in mask contour region, False = noise on full image
+    contour_noise_only = False,  # True = noise only in mask contour region, False = noise on full image
 ).cuda()
 
 # exp_name = "noise-contour-region-cond-mask-only"
-exp_name = "new-data-noise-contour-region-cond-mask-only"
+exp_name = "new-data-noise-full-region-cond-mask-only"
 
 trainer = Trainer(
     diffusion_model=diffusion,

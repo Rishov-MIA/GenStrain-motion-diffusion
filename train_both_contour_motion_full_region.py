@@ -20,11 +20,10 @@ diffusion = GaussianDiffusion(
     num_frames = 20,
     timesteps = 1000,   # number of steps
     loss_type = 'l2',   # L1 or L2
-    contour_noise_only = True,  # True = noise only in mask contour region, False = noise on full image
+    contour_noise_only = False,  # True = noise only in mask contour region, False = noise on full image
 ).cuda()
 
-# exp_name = "noise-contour-region-cond-mask-motion-both"
-exp_name = "new-data-noise-contour-region-cond-mask-motion-both"
+exp_name = "new-data-noise-full-region-cond-mask-motion-both"
 
 
 trainer = Trainer(
@@ -45,6 +44,6 @@ trainer = Trainer(
 )
 
 # Load the latest checkpoint (milestone = -1) if you want to retrain from latest checkpoint
-trainer.load(milestone=-1)
+# trainer.load(milestone=-1)
 
 trainer.train()

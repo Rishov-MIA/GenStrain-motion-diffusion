@@ -9,6 +9,7 @@ import os
 
 # DATA BASE PATH
 base_path = "/scratch/vst2hb/video-diffusion-pytorch/new-data-sona-latest/all_data_resampled_20_frames-most-latest"
+# base_path = "/scratch/vst2hb/Dataset_Processing/new-data-with-uk/all_data_resampled_20_frames-most-latest-with-uk"
 
 # Define argument parser
 parser = argparse.ArgumentParser(description="Video Diffusion Pytorch Script (Contour + Motion)")
@@ -70,10 +71,11 @@ diffusion = GaussianDiffusion(
     num_frames = 20,
     timesteps = 1000,   # number of steps
     loss_type = 'l2',   # L1 or L2
-    contour_noise_only = False,  # True = noise only in mask contour region, False = noise on full image
+    contour_noise_only = True,  # True = noise only in mask contour region, False = noise on full image
 ).cuda()
 
 exp_name = "noise-contour-region-cond-mask-motion-both"
+# exp_name = "new-data-noise-contour-region-cond-mask-motion-both"
 
 trainer = Trainer(
     diffusion_model=diffusion,

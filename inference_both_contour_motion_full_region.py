@@ -1,6 +1,6 @@
 import argparse
 import torch
-from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_after_only_contour import Unet3D, GaussianDiffusion, Trainer
+from video_diffusion_pytorch.video_diffusion_cross_attention_with_both_contour_motion import Unet3D, GaussianDiffusion, Trainer
 import random
 from pathlib import Path
 import numpy as np
@@ -12,7 +12,7 @@ import os
 base_path = "/scratch/vst2hb/Dataset_Processing/new-data-with-uk/all_data_resampled_20_frames-most-latest-with-uk"
 
 # Define argument parser
-parser = argparse.ArgumentParser(description="Video Diffusion Pytorch Script")
+parser = argparse.ArgumentParser(description="Video Diffusion Pytorch Script (Contour + Motion)")
 parser.add_argument('--video_type', type=str, default="cine", help='video type: cine and dense')
 parser.add_argument('--motion_place', type=str, default="after", help='before, after')
 parser.add_argument('--start', type=int, default=0, help='start index')
@@ -35,23 +35,26 @@ def normalize_divide_by_5(x: torch.Tensor) -> torch.Tensor:
     return x / 5.0
 
 
-def pick_condition_videos_one_video_at_once(contour_cond_video_dir, start, end):
-    # Convert string to a Path object
+def pick_condition_videos_one_video_at_once(contour_cond_video_dir, motion_cond_video_dir, start, end):
     contour_cond_video_dir = Path(contour_cond_video_dir)
-    contour_cond_video_paths = sorted(list(contour_cond_video_dir.glob("*.npy")))
+    motion_cond_video_dir = Path(motion_cond_video_dir)
 
-    # Select random indices
-    num_samples = len(contour_cond_video_paths)
+    contour_cond_video_paths = sorted(list(contour_cond_video_dir.glob("*.npy")))
     indices = range(len(contour_cond_video_paths))
 
-    for idx in indices[start: end]:
+    for idx in indices[start:end]:
         contour_cond_video_path = contour_cond_video_paths[idx]
-        contour_cond = np.load(contour_cond_video_path)
-        contour_cond_tensor = torch.from_numpy(contour_cond).float()  # shape [1, F, H, W]
         cond_filename = f"{contour_cond_video_path.stem}.npy"
         print(cond_filename)
 
-        yield contour_cond_tensor.unsqueeze(0), [cond_filename]
+        contour_cond = np.load(contour_cond_video_path)
+        contour_cond_tensor = torch.from_numpy(contour_cond).float()  # shape [1, F, H, W]
+
+        motion_cond_video_path = motion_cond_video_dir / cond_filename
+        motion_cond = np.load(motion_cond_video_path)
+        motion_cond_tensor = torch.from_numpy(motion_cond).float()  # shape [1, 2, F, H, W] — batch dim already included
+
+        yield contour_cond_tensor.unsqueeze(0), motion_cond_tensor, [cond_filename]
 
 
 model = Unet3D(
@@ -68,17 +71,18 @@ diffusion = GaussianDiffusion(
     num_frames = 20,
     timesteps = 1000,   # number of steps
     loss_type = 'l2',   # L1 or L2
-    contour_noise_only = True,  # True = noise only in mask contour region, False = noise on full image
+    contour_noise_only = False,  # True = noise only in mask contour region, False = noise on full image
 ).cuda()
 
-# exp_name = "noise-contour-region-cond-mask-only"
-exp_name = "new-data-noise-contour-region-cond-mask-only"
+exp_name = "new-data-noise-full-region-cond-mask-motion-both"
 
 trainer = Trainer(
     diffusion_model=diffusion,
     input_video_folder=f'{base_path}/dense/train/displacement_dense',
     contour_condition_video_dir=f'{base_path}/dense/train/dense_mask',
+    motion_condition_video_dir=f'{base_path}/tlrn_dense_mask_motion/train',
     sampling_contour_condition_video_dir=f'{base_path}/dense/test/dense_mask',
+    sampling_motion_condition_video_dir=f'{base_path}/tlrn_dense_mask_motion/test',
     train_batch_size = 20,
     train_lr = 1e-5,
     save_and_sample_every = 500,
@@ -93,8 +97,8 @@ trainer = Trainer(
 trainer.load(milestone=-1)
 
 contour_cond_video_dir = f"{base_path}/{video_type}/test/{video_type}_mask"
-video_generator = pick_condition_videos_one_video_at_once(contour_cond_video_dir, start, end)
-
+motion_cond_video_dir = f"{base_path}/tlrn_{video_type}_mask_motion/test"
+video_generator = pick_condition_videos_one_video_at_once(contour_cond_video_dir, motion_cond_video_dir, start, end)
 
 # Move to GPU if necessary
 device = next(trainer.ema_model.parameters()).device
@@ -102,21 +106,21 @@ custom_save_folder = f"./{exp_name}/sampling_time_sampled_{video_type}_part_vide
 os.makedirs(custom_save_folder, exist_ok=True)
 
 
-for contour_cond_video, cond_filename in video_generator:
-    contour_cond_video = normalize_cond_img(contour_cond_video)
-    contour_cond_video = contour_cond_video.to(device)
+for contour_cond_video, motion_cond_video, cond_filename in video_generator:
+    contour_cond_video = normalize_cond_img(contour_cond_video).to(device)
+    motion_cond_video = normalize_divide_by_5(motion_cond_video).to(device)
 
     # Generate samples
     if video_type == "cine":
         reconstructed_disp = None
-        trainer.sample_and_save_one_video_at_a_time("final", contour_cond_video, cond_filename, reconstructed_disp, None, save_folder=custom_save_folder)
+        trainer.sample_and_save_one_video_at_a_time("final", contour_cond_video, motion_cond_video, cond_filename, reconstructed_disp, None, save_folder=custom_save_folder)
     elif video_type == "dense":
         gt_disp_dir = f"{base_path}/dense/test/displacement_dense"
         gt_disp = np.load(os.path.join(gt_disp_dir, cond_filename[0]))
         reconstructed_disp = None
-        trainer.sample_and_save_one_video_at_a_time("final", contour_cond_video, cond_filename, reconstructed_disp, gt_disp, save_folder=custom_save_folder)
+        trainer.sample_and_save_one_video_at_a_time("final", contour_cond_video, motion_cond_video, cond_filename, reconstructed_disp, gt_disp, save_folder=custom_save_folder)
     elif video_type in ["paired_cine", "paired_dense"]:
         gt_disp_dir = f"{base_path}/paired_dense/test/displacement_dense"
         gt_disp = np.load(os.path.join(gt_disp_dir, cond_filename[0]))
         reconstructed_disp = None
-        trainer.sample_and_save_one_video_at_a_time("final", contour_cond_video, cond_filename, reconstructed_disp, gt_disp, save_folder=custom_save_folder)
+        trainer.sample_and_save_one_video_at_a_time("final", contour_cond_video, motion_cond_video, cond_filename, reconstructed_disp, gt_disp, save_folder=custom_save_folder)

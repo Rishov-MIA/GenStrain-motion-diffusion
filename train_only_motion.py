@@ -3,8 +3,8 @@ from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_only im
 
 
 # DATA BASE PATH
-base_path = "/scratch/vst2hb/video-diffusion-pytorch/new-data-sona-latest/all_data_resampled_20_frames-most-latest"
-
+# base_path = "/scratch/vst2hb/video-diffusion-pytorch/new-data-sona-latest/all_data_resampled_20_frames-rv"
+base_path = "/scratch/vst2hb/Dataset_Processing/new-data-with-uk/all_data_resampled_20_frames-most-latest-with-uk"
 model = Unet3D(
     dim = 48,
     cond_dim=None,           # video encoder output dim
@@ -21,7 +21,7 @@ diffusion = GaussianDiffusion(
     loss_type = 'l2',   # L1 or L2
 ).cuda()
 
-exp_name = "experiment-name-motion-only"
+exp_name = "new-data-noise-full-region-cond-mask-only"
 
 
 trainer = Trainer(
