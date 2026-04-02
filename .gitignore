@@ -18,6 +18,7 @@ MR*
 *.csv
 *.xls
 *.xlsx
+*.slurm
 
 # Distribution / packaging
 .Python
