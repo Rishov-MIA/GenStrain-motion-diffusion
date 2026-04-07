@@ -79,7 +79,8 @@ trainer = Trainer(
     gradient_accumulate_every = 1,
     ema_decay = 0.995,
     amp = True,
-    experiment_name=exp_name
+    experiment_name=exp_name,
+    inference_only=True,
 )
 
 # Load the latest checkpoint (milestone = -1)

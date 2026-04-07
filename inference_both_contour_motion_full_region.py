@@ -90,7 +90,8 @@ trainer = Trainer(
     gradient_accumulate_every = 1,     # gradient accumulation steps
     ema_decay = 0.995,                 # exponential moving average decay
     amp = True,                        # turn on mixed precision
-    experiment_name=exp_name
+    experiment_name=exp_name,
+    inference_only=True,
 )
 
 # Load the latest checkpoint (milestone = -1)
