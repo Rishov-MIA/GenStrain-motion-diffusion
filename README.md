@@ -1,8 +1,14 @@
-# GenStrain video diffusion
+# GenStrain Video Diffusion
 
-This repo trains and runs inference for a 3D video diffusion model conditioned on contour/mask videos.
+This repo trains and runs inference for 3D video diffusion models over displacement-field videos.
 
-## Environment setup
+Current model paths:
+
+- **Unconditional base model**: learns the displacement video distribution without any condition.
+- **Motion ControlNet model**: freezes the base UNet and trains a ControlNet branch that injects a 2-channel motion condition through zero-initialized residual adapters.
+- **Legacy motion-conditioned model**: `inference.py` still uses `video_diffusion_cross_attention_only_reg_motion.py`, where motion is mixed directly through cross-attention inside the main UNet.
+
+## Environment Setup
 
 ```bash
 conda create --name video-diffusion-env python=3.10 -y
@@ -12,78 +18,128 @@ mamba install pytorch==2.0.0 torchvision==0.15.0 torchaudio==2.0.0 pytorch-cuda=
 pip install -r requirements.txt
 ```
 
-Optional MKL downgrade (only if you hit the PyTorch MKL issue):
+Optional MKL downgrade, only if you hit the PyTorch MKL issue:
 
 ```bash
 mamba install mkl=2024.0.0 mkl-devel=2024.0.0 mkl-include=2024.0.0 -c conda-forge
 ```
 
-## Data layout
+## Data Layout
 
-Training and inference expect `.npy` videos. The trainer loads pairs of videos by matching filenames in two folders.
+Training and inference expect `.npy` videos.
 
-Expected layout (adapt as needed):
+Expected layout, adapt as needed:
 
-```
+```text
 <base_path>/
   dense/
     train/
-      displacement_dense/    # target videos (.npy)
-      dense_mask/            # contour/mask videos (.npy)
+      displacement_dense/    # target displacement videos (.npy)
     test/
-      dense_mask/            # contour/mask videos for sampling (.npy)
-      displacement_dense/    # optional GT for evaluation (.npy)
-  cine/
+      displacement_dense/    # motion conditions and optional GT (.npy)
+  paired_dense/
     test/
-      cine_mask/             # contour/mask videos for sampling (.npy)
+      displacement_dense/    # optional paired GT / conditions
 ```
 
 Notes:
 
-- The dataset uses `.npy` files only and matches them one-to-one by sorted filename order. **All files of** `b` **,** `cine_mask` **and** `displacement_dense` **should have the same filenames.**
-- `dense_mask` or `cine_mask` directory `.npy `files are expected to be shaped `[1, F, H, W]` where `F=20`, `H=48`, `W=48`
-- **Mask videos are binary with values 0 and 255.0**; traininng and inference normalizes them to 0–1 by dividing by 255.0.
-- `displacement_dense` directory  `.npy` files should contain displacement fields shaped `[1, 2, F, H, W]`.
+- Displacement videos should be shaped `[1, 2, F, H, W]`.
+- The default scripts use `F=20`, `H=48`, `W=48`.
+- Displacement and motion-condition values are normalized by dividing by `5.0`.
+- If your motion condition lives in a different folder from the target displacement videos, update `motion_condition_video_dir`, `sampling_motion_condition_video_dir`, or pass `--motion_condition_dir` during inference.
+- When loading paired target/condition data, files are matched by sorted filename order, so keep filenames aligned.
 
-## Training
+## Stage 1: Train Base Model
 
-1) Edit the dataset base path and experiment name in `train.py`:
+Edit `base_path` and `exp_name` in `train_base_unconditioned.py`:
 
 ```python
 base_path = "/path/to/data"
-exp_name = "my-experiment"
+exp_name = "base-unconditioned-experiment"
 ```
 
-2) (Optional) Adjust model/training hyperparameters in `train.py`.
-3) Run training:
+Run:
 
 ```bash
-python train.py
+python train_base_unconditioned.py
 ```
 
-Checkpoints are saved to `./<exp_name>/checkpoints/`.
+Base checkpoints are saved to:
 
-### Resume training
+```text
+./base-unconditioned-experiment/checkpoints/
+```
 
-Uncomment this line in `train.py` to resume from the latest checkpoint:
+To resume, uncomment:
 
 ```python
-trainer.load(milestone=-1)
+# trainer.load(milestone=-1)
 ```
 
-## Inference
+## Stage 2: Train Motion ControlNet
 
-1) Edit `base_path` and `exp_name` in `inference.py` to match your data and trained experiment.
-2) Make sure checkpoints exist in `./<exp_name>/checkpoints/`.
-3) Run inference:
+First train or provide an unconditional base checkpoint. Then edit `train_controlnet.py`:
+
+```python
+base_checkpoint_path = "./base-unconditioned-experiment/checkpoints/model-<milestone>.pt"
+exp_name = "controlnet-motion-experiment"
+```
+
+If `base_checkpoint_path` is left as `None`, ControlNet training starts with a randomly initialized base UNet, which is not the intended ControlNet workflow.
+
+Run:
 
 ```bash
-python inference.py --video_type cine
+python train_controlnet.py
 ```
 
-Arguments:
+ControlNet checkpoints are saved separately:
 
-- `--video_type`: `cine`, `dense`, `paired_cine`, `paired_dense`
-- `--start`, `--end`: index range for videos in the contour/mask folder (optional)
+```text
+./controlnet-motion-experiment/checkpoints/
+```
 
-Outputs are saved to `./<exp_name>/sampling_time_sampled_<video_type>_part_videos_infos/` and the folder is created automatically. Update `custom_save_folder` in `inference.py` if you want a different location.
+These do not overwrite the base checkpoints unless both scripts use the same `exp_name`.
+
+## ControlNet Inference
+
+Run with the latest ControlNet checkpoint:
+
+```bash
+python inference_controlnet.py --video_type dense --exp_name controlnet-motion-experiment --milestone -1
+```
+
+Useful arguments:
+
+- `--motion_condition_dir`: folder of motion-condition `.npy` files.
+- `--gt_dir`: optional folder of ground-truth displacement `.npy` files.
+- `--start`, `--end`: index range over sorted condition files.
+- `--cond_scale`: ControlNet strength. `1.0` is default; lower softens control, higher strengthens it.
+- `--save_folder`: optional output folder.
+
+Example with explicit folders:
+
+```bash
+python inference_controlnet.py \
+  --motion_condition_dir /path/to/conditions \
+  --gt_dir /path/to/ground_truth \
+  --exp_name controlnet-motion-experiment \
+  --milestone -1
+```
+
+Outputs are saved by default to:
+
+```text
+./controlnet-motion-experiment/controlnet_sampled_<video_type>_part_videos_infos/
+```
+
+## Legacy Motion-Conditioned Inference
+
+`inference.py` uses the older directly motion-conditioned model:
+
+```bash
+python inference.py --video_type dense
+```
+
+For new ControlNet experiments, use `inference_controlnet.py`.

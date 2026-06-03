@@ -1,6 +1,6 @@
 import argparse
 import torch
-from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_after_only_contour import Unet3D, GaussianDiffusion, Trainer
+from video_diffusion_pytorch.video_diffusion_cross_attention_only_reg_motion import Unet3D, GaussianDiffusion, Trainer
 import random
 from pathlib import Path
 import numpy as np

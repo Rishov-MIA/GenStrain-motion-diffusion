@@ -23,10 +23,7 @@ from einops_exts import check_shape, rearrange_many
 from rotary_embedding_torch import RotaryEmbedding
 
 from video_diffusion_pytorch.utils import (
-    generate_displacement_quiver_gifs,
-    generate_mask_disp_side_by_side_gif,
     generate_displacement_quiver_gifs_with_gt,
-    generate_displacement_quiver_gif_predicted_reconstructed_gt,
     generate_displacement_quiver_gif_comparison
 )
 
@@ -436,14 +433,14 @@ class Unet3D(nn.Module):
             channels, init_dim, (1, init_kernel_size, init_kernel_size), padding=(0, init_padding, init_padding)
         )
 
-        contour_cond_channels = 1
-        self.init_conv_contour_cond = nn.Conv3d(
-            contour_cond_channels,
+        # motion condition has 2 channels (x and y displacement)
+        motion_cond_channels = 2
+        self.init_conv_motion_cond = nn.Conv3d(
+            motion_cond_channels,
             init_dim,
             (1, init_kernel_size, init_kernel_size),
             padding=(0, init_padding, init_padding),
         )
-
 
         self.init_temporal_attn = Residual(PreNorm(init_dim, temporal_attn(init_dim)))
 
@@ -540,7 +537,7 @@ class Unet3D(nn.Module):
         self,
         x,
         time,
-        cond=None,  # cond = [contour_cond_video]
+        cond=None,  # cond = [motion_cond_video]  shape [B, 2, F, H, W]
         null_cond_prob=0.0,
         focus_present_mask=None,
         prob_focus_present=0.0,  # probability at which a given batch sample will focus on the present (0. is all off, 1. is completely arrested attention across time)
@@ -558,11 +555,10 @@ class Unet3D(nn.Module):
         # needed for if self.has_cond:
         # cond_original = cond.clone()
 
-        contour_cond = cond[0]
+        motion_cond = cond[0]
+        motion_cond = self.init_conv_motion_cond(motion_cond)
 
-        contour_cond = self.init_conv_contour_cond(contour_cond)
-
-        x = self.init_temporal_attn([x, contour_cond], x, pos_bias=time_rel_pos_bias)
+        x = self.init_temporal_attn([x, motion_cond], x, pos_bias=time_rel_pos_bias)
 
         r = x.clone()
 
@@ -586,24 +582,23 @@ class Unet3D(nn.Module):
             x = block1(x, t)
             x = block2(x, t)
 
-            contour_cond = cond_conv_1(contour_cond)
-            contour_cond = cond_conv_2(contour_cond)
+            motion_cond = cond_conv_1(motion_cond)
+            motion_cond = cond_conv_2(motion_cond)
 
-
-            x = spatial_attn([x, contour_cond], x)
-            x = temporal_attn([x, contour_cond], x, pos_bias=time_rel_pos_bias, focus_present_mask=focus_present_mask)
+            x = spatial_attn([x, motion_cond], x)
+            x = temporal_attn([x, motion_cond], x, pos_bias=time_rel_pos_bias, focus_present_mask=focus_present_mask)
 
             h.append(x)
             x = downsample(x)
 
-            contour_cond = downsample(contour_cond)
+            motion_cond = downsample(motion_cond)
 
         x = self.mid_block1(x, t)
 
-        x = self.mid_spatial_attn([x, contour_cond], x)
+        x = self.mid_spatial_attn([x, motion_cond], x)
 
         x = self.mid_temporal_attn(
-            [x, contour_cond], x, pos_bias=time_rel_pos_bias, focus_present_mask=focus_present_mask
+            [x, motion_cond], x, pos_bias=time_rel_pos_bias, focus_present_mask=focus_present_mask
         )
 
         x = self.mid_block2(x, t)
@@ -614,17 +609,14 @@ class Unet3D(nn.Module):
             x = block1(x, t)
             x = block2(x, t)
 
-            contour_cond = cond_conv_1(contour_cond)
-            contour_cond = cond_conv_2(contour_cond)
+            motion_cond = cond_conv_1(motion_cond)
+            motion_cond = cond_conv_2(motion_cond)
 
-
-            x = spatial_attn([x, contour_cond], x)
-            x = temporal_attn([x, contour_cond], x, pos_bias=time_rel_pos_bias, focus_present_mask=focus_present_mask)
-
+            x = spatial_attn([x, motion_cond], x)
+            x = temporal_attn([x, motion_cond], x, pos_bias=time_rel_pos_bias, focus_present_mask=focus_present_mask)
 
             x = upsample(x)
-
-            contour_cond = upsample(contour_cond)
+            motion_cond = upsample(motion_cond)
 
         x = torch.cat((x, r), dim=1)
         return self.final_conv(x)
@@ -772,6 +764,7 @@ class GaussianDiffusion(nn.Module):
         x_recon = self.predict_start_from_noise(
             x, t=t, noise=self.denoise_fn.forward_with_cond_scale(x, t, cond=cond, cond_scale=cond_scale)
         )
+        # print(f"max: {x_recon.max()}    min: {x_recon.min()}")
 
         if clip_denoised:
             s = 1.0
@@ -808,7 +801,7 @@ class GaussianDiffusion(nn.Module):
 
         for i in tqdm(reversed(range(0, self.num_timesteps)), desc="sampling loop time step", total=self.num_timesteps):
             img = self.p_sample(
-                img, torch.full((b,), i, device=device, dtype=torch.long), cond=[cond[0]], cond_scale=cond_scale # only contour
+                img, torch.full((b,), i, device=device, dtype=torch.long), cond=cond, cond_scale=cond_scale
             )
 
         return unnormalize_divide_by_5(img)
@@ -820,14 +813,14 @@ class GaussianDiffusion(nn.Module):
         if is_list_str(cond):
             cond = bert_embed(tokenize(cond)).to(device)
         elif len(cond) == 1 and isinstance(cond[0], torch.Tensor):  # video
-            contour_cond_video = cond[0].to(device)
+            motion_cond_video = cond[0].to(device)
 
-        batch_size = contour_cond_video.shape[0]
+        batch_size = motion_cond_video.shape[0]
         image_size = self.image_size
         channels = self.channels
         num_frames = self.num_frames
         return self.p_sample_loop(
-            (batch_size, channels, num_frames, image_size, image_size), cond=[contour_cond_video], cond_scale=cond_scale
+            (batch_size, channels, num_frames, image_size, image_size), cond=[motion_cond_video], cond_scale=cond_scale
         )
 
     @torch.inference_mode()
@@ -855,22 +848,20 @@ class GaussianDiffusion(nn.Module):
         )
 
     def p_losses(self, x_start, t, cond=None, noise=None, **kwargs):
-        # cond: [contour_cond_video]
+        # cond: [motion_cond_video]
         b, c, f, h, w, device = *x_start.shape, x_start.device
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        
+
         # add encoder here
         if is_list_str(cond):
             cond = bert_embed(tokenize(cond), return_cls_repr=self.text_use_bert_cls)  # (3, 768) => (B, embedding_size)
             cond = cond.to(device)
-        elif len(cond) == 1 and isinstance(cond[0], torch.Tensor):  # only contour video
-            # encoder = ConditionVideoEncoder(in_channels=1) # condition video has 1 channel
-            # cond = encoder(cond)
-            contour_cond_video = cond[0].to(device)
+        elif len(cond) == 1 and isinstance(cond[0], torch.Tensor):  # video
+            motion_cond_video = cond[0].to(device)
 
-        x_recon = self.denoise_fn(x_noisy, t, cond=[contour_cond_video], **kwargs) 
+        x_recon = self.denoise_fn(x_noisy, t, cond=[motion_cond_video], **kwargs) 
 
         # epsilon given. extract x0
         # forward x0 print from predicted noise x_recon
@@ -889,7 +880,7 @@ class GaussianDiffusion(nn.Module):
         return loss, unnormalize_divide_by_5(x0), unnormalize_divide_by_5(x_start)
         
     def forward(self, x, cond=None, *args, **kwargs):
-        # cond type: [contour_cond_video]
+        # cond type: [motion_cond_video]
         (
             b,
             device,
@@ -903,8 +894,8 @@ class GaussianDiffusion(nn.Module):
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
         
         x = normalize_divide_by_5(x)
-        contour_cond_video = normalize_cond_img(cond[0])
-        return self.p_losses(x, t, cond=[contour_cond_video], **kwargs)
+        motion_cond_video = normalize_divide_by_5(cond[0])
+        return self.p_losses(x, t, cond=[motion_cond_video], **kwargs)
     
     
     @torch.inference_mode()
@@ -1024,7 +1015,7 @@ class Dataset(data.Dataset):
         self,
         input_video_folder,
         image_size,
-        contour_condition_video_dir,
+        motion_condition_video_dir,
         channels=2,  # input video has 2 channels
         num_frames=16,
         horizontal_flip=False,
@@ -1033,7 +1024,7 @@ class Dataset(data.Dataset):
     ):
         super().__init__()
         self.input_video_folder = input_video_folder
-        self.contour_condition_video_dir = contour_condition_video_dir
+        self.motion_condition_video_dir = motion_condition_video_dir
         self.image_size = image_size
         self.channels = channels
 
@@ -1042,19 +1033,19 @@ class Dataset(data.Dataset):
         input_video_paths = [p for ext in exts for p in Path(f"{input_video_folder}").glob(f"**/*.{ext}")]
         input_video_paths = sorted(input_video_paths)
 
-        contour_condition_video_paths = [
-            p for ext in exts for p in Path(f"{contour_condition_video_dir}").glob(f"**/*.{ext}")
+        motion_condition_video_paths = [
+            p for ext in exts for p in Path(f"{motion_condition_video_dir}").glob(f"**/*.{ext}")
         ]
-        contour_condition_video_paths = sorted(contour_condition_video_paths)
+        motion_condition_video_paths = sorted(motion_condition_video_paths)
 
         assert len(input_video_paths) == len(
-            contour_condition_video_paths
-        ), "Number of target and contour conditioning videos must match"
+            motion_condition_video_paths
+        ), "Number of target and motion conditioning videos must match"
 
-        for input_path, contour_condition_path in zip(
-            input_video_paths, contour_condition_video_paths
+        for input_path, motion_condition_path in zip(
+            input_video_paths, motion_condition_video_paths
         ):
-            self.video_pairs.append((input_path, contour_condition_path))
+            self.video_pairs.append((input_path, motion_condition_path))
         
         # Cache initialization
         self.cache = {}
@@ -1064,50 +1055,50 @@ class Dataset(data.Dataset):
         return len(self.video_pairs)
 
     def __getitem__(self, index):
-        input_video_path, contour_condition_video_path = self.video_pairs[index]
+        input_video_path, motion_condition_video_path = self.video_pairs[index]
 
         # Lazy loading and caching: Load the video data only once, then cache it for future use
         if index not in self.cache:
             # Load input video data
             input_video_tensor = torch.from_numpy(np.load(input_video_path)).float()
-            contour_condition_video_tensor = torch.from_numpy(np.load(contour_condition_video_path)).float()
+            motion_condition_video_tensor = torch.from_numpy(np.load(motion_condition_video_path)).float()
 
             # Cache the data
-            self.cache[index] = (input_video_tensor, contour_condition_video_tensor)
+            self.cache[index] = (input_video_tensor, motion_condition_video_tensor)
         else:
             # Retrieve from cache
-            input_video_tensor, contour_condition_video_tensor = self.cache[index]
+            input_video_tensor, motion_condition_video_tensor = self.cache[index]
 
         # Optionally, you can apply any transformations here (like resizing, normalization, etc.)
         # For now, return the tensors directly
         return (
             input_video_tensor.squeeze(0),  # Remove extra dimension
-            contour_condition_video_tensor,
+            motion_condition_video_tensor.squeeze(0),  # Remove extra dimension
         )
 
-def random_pick_condition_videos(num_samples, contour_cond_video_dir):
+def random_pick_condition_videos(num_samples, motion_cond_video_dir):
     # Convert string to a Path object
-    contour_cond_video_dir = Path(contour_cond_video_dir)
-
-    contour_cond_video_paths = sorted(list(contour_cond_video_dir.glob("*.npy")))
+    motion_cond_video_dir = Path(motion_cond_video_dir)
+    motion_cond_video_paths = sorted(list(motion_cond_video_dir.glob("*.npy")))
 
     # Select random indices
-    num_samples = min(num_samples, len(contour_cond_video_paths))
-    indices = random.sample(range(len(contour_cond_video_paths)), num_samples)
+    num_samples = min(num_samples, len(motion_cond_video_paths))
+    indices = random.sample(range(len(motion_cond_video_paths)), num_samples)
 
-    contour_cond_tensors = []
+    motion_cond_tensors = []
     filenames = []
 
     for idx in indices:
-        contour_cond_video_path = contour_cond_video_paths[idx]
-        contour_cond = np.load(contour_cond_video_path)
-        contour_cond_tensor = torch.from_numpy(contour_cond).float()  # shape [1, F, H, W]
-        contour_cond_tensors.append(contour_cond_tensor.unsqueeze(0))  # add batch dim => [batch, 1, F, H, W]
-        filenames.append(f"{contour_cond_video_path.stem}.npy")  # store the base filename, e.g. "my_video"
+        motion_cond_video_path = motion_cond_video_paths[idx]
+        motion_cond = np.load(motion_cond_video_path)
+        motion_cond_tensor = torch.from_numpy(motion_cond).float()  # shape [1, 2, F, H, W]
+        motion_cond_tensors.append(motion_cond_tensor)  # add batch dim => [batch, 2, F, H, W]
 
-    contour_cond_tensors = torch.cat(contour_cond_tensors, dim=0)
+        filenames.append(f"{motion_cond_video_path.stem}.npy")  # store the base filename, e.g. "my_video"
 
-    return contour_cond_tensors, filenames
+    motion_cond_tensors = torch.cat(motion_cond_tensors, dim=0)
+
+    return motion_cond_tensors, filenames
 
 
 class Trainer(object):
@@ -1116,8 +1107,8 @@ class Trainer(object):
         diffusion_model,
         input_video_folder,
         *,
-        contour_condition_video_dir=None,  # folder with condition dense videos for training
-        sampling_contour_condition_video_dir=None,  # folder with condition cine videos for sampling
+        motion_condition_video_dir=None,  # folder with motion condition dense videos for training
+        sampling_motion_condition_video_dir=None,  # folder with motion condition cine videos for sampling
         ema_decay=0.995,
         num_frames=16,
         train_batch_size=32,
@@ -1137,7 +1128,7 @@ class Trainer(object):
         self.ema = EMA(ema_decay)
         self.ema_model = copy.deepcopy(self.model)
         self.update_ema_every = update_ema_every
-        self.sampling_contour_condition_video_dir = sampling_contour_condition_video_dir
+        self.sampling_motion_condition_video_dir = sampling_motion_condition_video_dir
 
         self.step_start_ema = step_start_ema
         self.save_and_sample_every = save_and_sample_every
@@ -1155,7 +1146,7 @@ class Trainer(object):
             self.ds = Dataset(
                 input_video_folder,
                 image_size,
-                contour_condition_video_dir,
+                motion_condition_video_dir,
                 channels=channels,
                 num_frames=num_frames,
             )
@@ -1220,14 +1211,14 @@ class Trainer(object):
 
         while self.step < self.train_num_steps:
             for i in range(self.gradient_accumulate_every):
-                input_video, contour_cond_video = next(self.dl)
+                input_video, motion_cond_video = next(self.dl)
                 input_video = input_video.cuda()
-                contour_cond_video = contour_cond_video.cuda()
+                motion_cond_video = motion_cond_video.cuda()
 
                 with autocast(enabled=self.amp):
                     loss, x0, x_start = self.model(
                         input_video,
-                        cond=[contour_cond_video],
+                        cond=[motion_cond_video],
                         prob_focus_present=prob_focus_present,
                         focus_present_mask=focus_present_mask,
                     )
@@ -1268,21 +1259,21 @@ class Trainer(object):
                 milestone = self.step // self.save_and_sample_every
                 self.save(milestone)
 
-                sample_contour_cond, sample_cond_filenames = random_pick_condition_videos(
+                sample_motion_cond, sample_cond_filenames = random_pick_condition_videos(
                     num_samples=1,
-                    contour_cond_video_dir=self.sampling_contour_condition_video_dir,
+                    motion_cond_video_dir=self.sampling_motion_condition_video_dir,
                 )
                 # normalize cine contour condition image here
-                sample_contour_cond = normalize_cond_img(sample_contour_cond)
+                sample_motion_cond = normalize_divide_by_5(sample_motion_cond)
 
                 # If your training set is on CPU, move to GPU:
                 device = next(self.ema_model.parameters()).device
-                sample_contour_cond = sample_contour_cond.to(device)
+                sample_motion_cond = sample_motion_cond.to(device)
 
                 # sample a grid
                 self.sample_and_save(
                     milestone,
-                    contour_cond_video=sample_contour_cond,
+                    motion_cond_video=sample_motion_cond,
                     cond_filenames=sample_cond_filenames,
                     save_folder=f"./{self.experiment_name}/sampled_videos_infos",
                 )
@@ -1296,20 +1287,18 @@ class Trainer(object):
     def sample_and_save(
         self,
         milestone,
-        contour_cond_video=None,
+        motion_cond_video=None,
         cond_filenames=None,
         cond_scale=2.0,
         save_folder="./sampled_videos_infos",
     ):
         # Number of samples to generate
-        # cond video shape [num_samples, 1, F, H, W]
-        num_samples = contour_cond_video.shape[0]
+        # motion_cond_video shape [num_samples, 2, F, H, W]
+        num_samples = motion_cond_video.shape[0]
 
-        sampled_videos = self.ema_model.sample(cond=[contour_cond_video], cond_scale=cond_scale, batch_size=num_samples)
+        sampled_videos = self.ema_model.sample(cond=[motion_cond_video], cond_scale=cond_scale, batch_size=num_samples)
         sampled_videos = sampled_videos.cpu().numpy() # [num_samples, 2, F, H, W]
         sampled_videos = np.expand_dims(sampled_videos, axis=1) # [num_samples, 1, 2, F, H, W]
-        # to unnormalize it multiply with 255.0
-        contour_cond_video = contour_cond_video.cpu().numpy() * 255.0
 
         save_folder = Path(save_folder)
         save_folder.mkdir(exist_ok=True, parents=True)
@@ -1317,7 +1306,6 @@ class Trainer(object):
         # Create subdirectories for ground truths and sampled videos
         sampled_folder = save_folder / "inference_disps"
         sampled_folder.mkdir(exist_ok=True, parents=True)
-
 
         # Instead of saving one big file, loop over each sample
         for i in range(num_samples):
@@ -1337,11 +1325,12 @@ class Trainer(object):
         # Create output directory if needed
         output_dir = Path(output_gif_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        
-        generate_mask_disp_side_by_side_gif(
-            contour_cond_video[0],
-            sampled_videos[0],
+
+        generate_displacement_quiver_gif_comparison(
+            motion_cond_video,
+            sampled_disp_single,
             output_path=f"{output_gif_dir}/milestone_{milestone}_{cond_filenames[0].split('.npy')[0]}.gif",
+            titles=["motion condition", "Predicted"]
         )
         
 
@@ -1349,7 +1338,7 @@ class Trainer(object):
     def sample_and_save_one_video_at_a_time(
         self,
         milestone,
-        contour_cond_video=None,
+        motion_cond_video=None,
         cond_filenames=None,
         reconstructed_disp=None,
         gt_disp=None,
@@ -1357,14 +1346,12 @@ class Trainer(object):
         save_folder="./sampled_videos_infos",
     ):
         # Number of samples to generate
-        # cond video shape [num_samples, 1, F, H, W]
-        num_samples = contour_cond_video.shape[0]
+        # motion_cond_video shape [num_samples, 1, 2, F, H, W]
+        num_samples = motion_cond_video.shape[0]
 
-        sampled_videos = self.ema_model.sample(cond=[contour_cond_video], cond_scale=cond_scale, batch_size=num_samples)
+        sampled_videos = self.ema_model.sample(cond=[motion_cond_video], cond_scale=cond_scale, batch_size=num_samples)
         sampled_videos = sampled_videos.cpu().numpy() # [num_samples, 2, F, H, W]
         sampled_videos = np.expand_dims(sampled_videos, axis=1) # [num_samples, 1, 2, F, H, W]
-        # to unnormalize it multiply with 255.0
-        contour_cond_video = contour_cond_video.cpu().numpy() * 255.0
 
         save_folder = Path(save_folder)
         save_folder.mkdir(exist_ok=True, parents=True)
@@ -1392,11 +1379,10 @@ class Trainer(object):
             sampled_disp_path = sampled_folder / f"{base_name}"
             np.save(sampled_disp_path, sampled_disp_single)
 
-            if reconstructed_disp is None and gt_disp is None:
-                generate_mask_disp_side_by_side_gif(contour_cond_video[i], sampled_disp_single, output_path=f"{output_gif_dir}/{cond_filenames[0].split('.npy')[0]}.gif")
-            elif reconstructed_disp is None and gt_disp is not None:
-                generate_displacement_quiver_gif_comparison(sampled_disp_single, gt_disp, output_path=f"{output_gif_dir}/{cond_filenames[0].split('.npy')[0]}.gif", titles=["Predicted", "Ground Truth"])
-            elif reconstructed_disp is not None and gt_disp is None:
-                generate_displacement_quiver_gif_comparison(sampled_disp_single, reconstructed_disp, output_path=f"{output_gif_dir}/{cond_filenames[0].split('.npy')[0]}.gif", titles=["Predicted", "Reconstructed"])
-            else:
-                generate_displacement_quiver_gif_predicted_reconstructed_gt(sampled_disp_single, reconstructed_disp, gt_disp, output_path=f"{output_gif_dir}/{cond_filenames[0].split('.npy')[0]}.gif")
+            if reconstructed_disp is None and gt_disp is not None:
+                generate_displacement_quiver_gif_comparison(
+                    sampled_disp_single,
+                    gt_disp,
+                    output_path=f"{output_gif_dir}/{cond_filenames[0].split('.npy')[0]}.gif",
+                    titles=["Predicted", "Ground Truth"]
+                )
