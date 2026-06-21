@@ -71,6 +71,49 @@ Uncomment this line in `train.py` to resume from the latest checkpoint:
 trainer.load(milestone=-1)
 ```
 
+### Multi-GPU training (DDP)
+
+For faster training on a single machine with multiple GPUs, use `train_full_region_ddp.py`,
+which trains the full-region model with PyTorch `DistributedDataParallel` (DDP). The single-GPU
+scripts are untouched; this is a separate entry point.
+
+1) Edit the dataset base path, experiment name, and data dimensions at the top of
+   `train_full_region_ddp.py`:
+
+```python
+base_path = "/path/to/data"
+IMAGE_SIZE = 64   # H == W of your .npy videos
+NUM_FRAMES = 32   # number of frames in your .npy videos
+PER_GPU_BATCH = 5 # see note below
+```
+
+2) Launch with `torchrun`, setting `--nproc_per_node` to your GPU count (single node):
+
+```bash
+# 4 GPUs
+torchrun --standalone --nproc_per_node=4 train_full_region_ddp.py
+
+# 2 GPUs
+torchrun --standalone --nproc_per_node=2 train_full_region_ddp.py
+```
+
+Key points:
+
+- **`PER_GPU_BATCH` is per-GPU.** The effective (global) batch is `PER_GPU_BATCH * num_gpus`.
+  To reproduce a single-GPU global batch of 20 on 4 GPUs, set `PER_GPU_BATCH = 5`. If you grow
+  the global batch, scale `train_lr` accordingly (linear scaling is a reasonable starting point).
+- Larger data costs more memory: 64×64 with 32 frames is roughly 4–5× the per-sample memory of
+  48×48 with 20 frames. Lower `PER_GPU_BATCH` (start small, e.g. 2) until it fits, and use
+  `gradient_accumulate_every` to recover effective batch size if needed.
+- `IMAGE_SIZE` / `NUM_FRAMES` must match the actual shape of your `.npy` files — the dataset does
+  not resize or resample, and a shape mismatch will assert at the first step.
+- **Resume is automatic.** On startup the script loads the latest checkpoint (`milestone=-1`) if
+  one exists, and otherwise starts from scratch. Checkpoints are written by rank 0 to
+  `./<exp_name>/checkpoints/` and are compatible with the single-GPU trainer and inference scripts.
+- Checkpointing, sampling, and logging run on rank 0 only, so you get a single set of outputs.
+- This path is single-node. Multi-node would only require a different `torchrun` rendezvous launch;
+  the training code already supports it.
+
 ## Inference
 
 1) Edit `base_path` and `exp_name` in `inference.py` to match your data and trained experiment.
