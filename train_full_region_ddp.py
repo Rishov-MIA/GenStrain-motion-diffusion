@@ -36,7 +36,7 @@ IMAGE_SIZE = 64   # H == W
 NUM_FRAMES = 32
 
 # Per-GPU batch size. Effective global batch = PER_GPU_BATCH * num_gpus.
-PER_GPU_BATCH = 5
+PER_GPU_BATCH = 10
 
 
 def main():
@@ -59,8 +59,8 @@ def main():
         contour_noise_only=False,  # True = noise only in mask contour region, False = full image
     ).to(device)
 
-    exp_name = "new-data-noise-full-region-cond-mask-only"
-
+    exp_name = "proposal-genstrain-new-32-frames"
+    
     trainer = DDPTrainer(
         diffusion_model=diffusion,
         input_video_folder=f"{base_path}/dense/train/displacement_dense",

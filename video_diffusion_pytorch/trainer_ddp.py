@@ -30,7 +30,19 @@ from torch.optim import Adam
 from torch.utils import data
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.cuda.amp import autocast, GradScaler
+
+# AMP: prefer the new torch.amp API (torch >= 2.3). Fall back to the deprecated
+# torch.cuda.amp on older torch so this file stays backward compatible.
+try:
+    from torch.amp import autocast as _autocast, GradScaler as _GradScaler
+
+    def autocast(enabled=True):
+        return _autocast("cuda", enabled=enabled)
+
+    def GradScaler(enabled=True):
+        return _GradScaler("cuda", enabled=enabled)
+except ImportError:  # torch < 2.3
+    from torch.cuda.amp import autocast, GradScaler
 
 from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_after_only_contour import (
     Trainer,
@@ -67,9 +79,11 @@ def setup_distributed():
     """
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
-    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
-        torch.distributed.init_process_group(backend="nccl")
     device = torch.device("cuda", local_rank)
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        # Pass device_id so collectives (e.g. barrier) know the device and don't
+        # warn about inferring it from the current device.
+        torch.distributed.init_process_group(backend="nccl", device_id=device)
     return local_rank, get_rank(), get_world_size(), device
 
 
