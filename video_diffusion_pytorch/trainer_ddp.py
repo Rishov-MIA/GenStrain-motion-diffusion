@@ -1,0 +1,309 @@
+"""
+DistributedDataParallel (DDP) variant of the Trainer for multi-GPU, single-node
+training.
+
+This subclasses the existing single-GPU Trainer in
+`video_diffusion_cross_attention_with_motion_after_only_contour` and overrides
+only the parts that must be DDP-aware:
+
+  * the model is wrapped in DistributedDataParallel
+  * the DataLoader uses a DistributedSampler so each rank sees a disjoint shard
+  * checkpoint save/load, EMA, sampling, GIF/console logging happen on rank 0 only
+  * the underlying (unwrapped) model is used for EMA + checkpointing
+
+Launch with torchrun, e.g. (4 GPUs on one node):
+
+    torchrun --standalone --nproc_per_node=4 train_full_region_ddp.py
+
+IMPORTANT: with DDP the `train_batch_size` you pass is PER-GPU. The effective
+(global) batch is `train_batch_size * world_size`. Scale the learning rate
+accordingly (a common starting point is linear scaling).
+"""
+
+import os
+import copy
+
+import torch
+from torch import nn
+from torch.optim import Adam
+from torch.utils import data
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.cuda.amp import autocast, GradScaler
+
+from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_after_only_contour import (
+    Trainer,
+    EMA,
+    Dataset,
+    cycle,
+    exists,
+    noop,
+    normalize_cond_img,
+    random_pick_condition_videos,
+)
+
+
+def is_dist():
+    return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+
+def get_rank():
+    return torch.distributed.get_rank() if is_dist() else 0
+
+
+def get_world_size():
+    return torch.distributed.get_world_size() if is_dist() else 1
+
+
+def is_main_process():
+    return get_rank() == 0
+
+
+def setup_distributed():
+    """Initialize the process group from torchrun-provided env vars.
+
+    Returns (local_rank, global_rank, world_size, device).
+    """
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        torch.distributed.init_process_group(backend="nccl")
+    device = torch.device("cuda", local_rank)
+    return local_rank, get_rank(), get_world_size(), device
+
+
+def cleanup_distributed():
+    if is_dist():
+        torch.distributed.destroy_process_group()
+
+
+class DDPTrainer(Trainer):
+    def __init__(self, diffusion_model, input_video_folder, *, local_rank=0, **kwargs):
+        # We need to customize DataLoader / model wrapping, so we deliberately do
+        # NOT call super().__init__ (it builds a non-distributed DataLoader and
+        # never wraps the model). Instead we replicate the relevant setup here.
+        self.local_rank = local_rank
+        self.device = torch.device("cuda", local_rank)
+        self.world_size = get_world_size()
+
+        ema_decay = kwargs.get("ema_decay", 0.995)
+        self.model = diffusion_model  # already on the correct device by caller
+        self.ema = EMA(ema_decay)
+        # EMA is maintained from the *unwrapped* model on rank 0 only.
+        self.ema_model = copy.deepcopy(self.model)
+        self.update_ema_every = kwargs.get("update_ema_every", 10)
+        self.sampling_contour_condition_video_dir = kwargs.get("sampling_contour_condition_video_dir")
+
+        self.step_start_ema = kwargs.get("step_start_ema", 2000)
+        self.save_and_sample_every = kwargs.get("save_and_sample_every", 1000)
+
+        # NOTE: per-GPU batch size.
+        self.batch_size = kwargs.get("train_batch_size", 32)
+        self.image_size = diffusion_model.image_size
+        self.gradient_accumulate_every = kwargs.get("gradient_accumulate_every", 2)
+        self.train_num_steps = kwargs.get("train_num_steps", 100000)
+
+        image_size = diffusion_model.image_size
+        channels = diffusion_model.channels
+        num_frames = diffusion_model.num_frames
+
+        inference_only = kwargs.get("inference_only", False)
+        contour_condition_video_dir = kwargs.get("contour_condition_video_dir")
+        train_lr = kwargs.get("train_lr", 1e-4)
+
+        if not inference_only:
+            self.ds = Dataset(
+                input_video_folder,
+                image_size,
+                contour_condition_video_dir,
+                channels=channels,
+                num_frames=num_frames,
+            )
+
+            if is_main_process():
+                print(f"found {len(self.ds)} videos as .npy files at {input_video_folder}")
+            assert len(self.ds) > 0, "need to have at least 1 video to start training"
+
+            self.sampler = DistributedSampler(
+                self.ds,
+                num_replicas=self.world_size,
+                rank=get_rank(),
+                shuffle=True,
+                drop_last=True,
+            )
+            self.dl = cycle(
+                data.DataLoader(
+                    self.ds,
+                    batch_size=self.batch_size,
+                    sampler=self.sampler,
+                    pin_memory=True,
+                    num_workers=kwargs.get("num_workers", 4),
+                    drop_last=True,
+                )
+            )
+            # Optimizer is built on the DDP-wrapped module's params (same params,
+            # just wrapped). We wrap first, then build the optimizer.
+            self.ddp_model = DDP(
+                self.model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=False,
+            )
+            self.opt = Adam(self.ddp_model.parameters(), lr=train_lr)
+        else:
+            self.ddp_model = self.model
+
+        self.step = 0
+
+        self.amp = kwargs.get("amp", False)
+        self.scaler = GradScaler(enabled=self.amp)
+        self.max_grad_norm = kwargs.get("max_grad_norm")
+
+        self.experiment_name = kwargs.get("experiment_name", "test-exp")
+
+        from pathlib import Path
+
+        checkpoints_folder = f"./{self.experiment_name}/checkpoints"
+        self.checkpoints_folder = Path(checkpoints_folder)
+        if is_main_process():
+            self.checkpoints_folder.mkdir(exist_ok=True, parents=True)
+
+        self.reset_parameters()
+
+    # ---- checkpointing: unwrap DDP, only rank 0 writes ----
+
+    @property
+    def raw_model(self):
+        """The underlying nn.Module regardless of DDP wrapping."""
+        return self.ddp_model.module if isinstance(self.ddp_model, DDP) else self.ddp_model
+
+    def save(self, milestone):
+        if not is_main_process():
+            return
+        ckpt = {
+            "step": self.step,
+            "model": self.raw_model.state_dict(),
+            "ema": self.ema_model.state_dict(),
+            "scaler": self.scaler.state_dict(),
+        }
+        torch.save(ckpt, str(self.checkpoints_folder / f"model-{milestone}.pt"))
+
+    def load(self, milestone, **kwargs):
+        from pathlib import Path
+
+        if milestone == -1:
+            all_milestones = [int(p.stem.split("-")[-1]) for p in Path(self.checkpoints_folder).glob("**/*.pt")]
+            assert len(all_milestones) > 0, "need at least one milestone to load from (milestone == -1)"
+            milestone = max(all_milestones)
+
+        # Load onto this rank's device.
+        map_location = {"cuda:0": f"cuda:{self.local_rank}"}
+        ckpt = torch.load(str(self.checkpoints_folder / f"model-{milestone}.pt"), map_location=map_location)
+
+        if is_main_process():
+            print(f"loaded checkpoint: model-{milestone}.pt\n")
+
+        self.step = ckpt["step"]
+        self.raw_model.load_state_dict(ckpt["model"], **kwargs)
+        self.ema_model.load_state_dict(ckpt["ema"], **kwargs)
+        self.scaler.load_state_dict(ckpt["scaler"])
+
+    # ---- EMA from the unwrapped model ----
+
+    def reset_parameters(self):
+        self.ema_model.load_state_dict(self.raw_model.state_dict())
+
+    def step_ema(self):
+        if self.step < self.step_start_ema:
+            self.reset_parameters()
+            return
+        self.ema.update_model_average(self.ema_model, self.raw_model)
+
+    # ---- training loop ----
+
+    def train(self, prob_focus_present=0.0, focus_present_mask=None, log_fn=noop):
+        assert callable(log_fn)
+
+        while self.step < self.train_num_steps:
+            # Reshuffle the shard each "epoch-ish" so ranks don't repeat order.
+            if hasattr(self, "sampler"):
+                self.sampler.set_epoch(self.step)
+
+            for i in range(self.gradient_accumulate_every):
+                input_video, contour_cond_video = next(self.dl)
+                input_video = input_video.to(self.device, non_blocking=True)
+                contour_cond_video = contour_cond_video.to(self.device, non_blocking=True)
+
+                # Only sync gradients on the last accumulation micro-step.
+                is_last_micro = i == (self.gradient_accumulate_every - 1)
+                sync_ctx = (
+                    self.ddp_model.no_sync()
+                    if (isinstance(self.ddp_model, DDP) and not is_last_micro)
+                    else _nullcontext()
+                )
+
+                with sync_ctx:
+                    with autocast(enabled=self.amp):
+                        loss, _, _ = self.ddp_model(
+                            input_video,
+                            cond=[contour_cond_video],
+                            prob_focus_present=prob_focus_present,
+                            focus_present_mask=focus_present_mask,
+                        )
+                        self.scaler.scale(loss / self.gradient_accumulate_every).backward()
+
+            if is_main_process():
+                print(f"{self.step}: {loss.item()}")
+
+            log = {"loss": loss.item()}
+
+            if exists(self.max_grad_norm):
+                self.scaler.unscale_(self.opt)
+                nn.utils.clip_grad_norm_(self.ddp_model.parameters(), self.max_grad_norm)
+
+            self.scaler.step(self.opt)
+            self.scaler.update()
+            self.opt.zero_grad()
+
+            if self.step % self.update_ema_every == 0:
+                self.step_ema()
+
+            # rank-0-only sampling / checkpointing
+            if is_main_process():
+                if self.step != 0 and self.step % self.save_and_sample_every == 0:
+                    milestone = self.step // self.save_and_sample_every
+                    self.save(milestone)
+
+                    sample_contour_cond, sample_cond_filenames = random_pick_condition_videos(
+                        num_samples=1,
+                        contour_cond_video_dir=self.sampling_contour_condition_video_dir,
+                    )
+                    sample_contour_cond = normalize_cond_img(sample_contour_cond)
+                    device = next(self.ema_model.parameters()).device
+                    sample_contour_cond = sample_contour_cond.to(device)
+
+                    self.sample_and_save(
+                        milestone,
+                        contour_cond_video=sample_contour_cond,
+                        cond_filenames=sample_cond_filenames,
+                        save_folder=f"./{self.experiment_name}/sampled_videos_infos",
+                    )
+
+            log_fn(log)
+            self.step += 1
+
+            # Keep all ranks aligned before the next step (so rank-0 sampling,
+            # which can take a while, doesn't desync gradient all-reduces).
+            if is_dist():
+                torch.distributed.barrier()
+
+        if is_main_process():
+            print("training completed")
+
+
+class _nullcontext:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *exc):
+        return False

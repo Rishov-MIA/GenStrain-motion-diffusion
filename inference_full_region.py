@@ -16,7 +16,7 @@ parser = argparse.ArgumentParser(description="Video Diffusion Pytorch Script")
 parser.add_argument('--video_type', type=str, default="cine", help='video type: cine and dense')
 parser.add_argument('--motion_place', type=str, default="after", help='before, after')
 parser.add_argument('--start', type=int, default=0, help='start index')
-parser.add_argument('--end', type=int, default=132, help='end index')
+parser.add_argument('--end', type=int, default=None, help='end index (default: number of mask files)')
 
 # Parse the arguments
 args = parser.parse_args()
@@ -40,8 +40,9 @@ def pick_condition_videos_one_video_at_once(contour_cond_video_dir, start, end):
     contour_cond_video_dir = Path(contour_cond_video_dir)
     contour_cond_video_paths = sorted(list(contour_cond_video_dir.glob("*.npy")))
 
-    # Select random indices
-    num_samples = len(contour_cond_video_paths)
+    if end is None:
+        end = len(contour_cond_video_paths)
+
     indices = range(len(contour_cond_video_paths))
 
     for idx in indices[start: end]:
