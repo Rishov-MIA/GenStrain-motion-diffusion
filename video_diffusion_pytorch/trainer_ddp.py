@@ -22,6 +22,7 @@ accordingly (a common starting point is linear scaling).
 
 import os
 import copy
+import inspect
 
 import torch
 from torch import nn
@@ -197,8 +198,15 @@ class DDPTrainer(Trainer):
             milestone = max(all_milestones)
 
         # Load onto this rank's device.
+        # torch >= 2.6 flipped torch.load's default to weights_only=True, which
+        # rejects our checkpoint dicts; pass weights_only=False there. Older torch
+        # (e.g. 2.0) doesn't accept that kwarg, so only pass it when supported.
         map_location = {"cuda:0": f"cuda:{self.local_rank}"}
-        ckpt = torch.load(str(self.checkpoints_folder / f"model-{milestone}.pt"), map_location=map_location)
+        ckpt_path = str(self.checkpoints_folder / f"model-{milestone}.pt")
+        if "weights_only" in inspect.signature(torch.load).parameters:
+            ckpt = torch.load(ckpt_path, map_location=map_location, weights_only=False)
+        else:
+            ckpt = torch.load(ckpt_path, map_location=map_location)
 
         if is_main_process():
             print(f"loaded checkpoint: model-{milestone}.pt\n")
