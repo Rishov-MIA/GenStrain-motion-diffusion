@@ -41,9 +41,12 @@ def generate_displacement_quiver_gif(transformation_field, output_path, scale=1,
             fig, ax = plt.subplots(figsize=(5, 5))
             ax.set_facecolor("black")  # Set background to black
             ax.set_aspect("equal")
+            ax.set_xlim(0, w)
+            ax.set_ylim(h, 0)  # image convention: row 0 at top
 
-            # Plot the displacement vectors
-            ax.quiver(x, y, displacement_x[frame_idx], displacement_y[frame_idx], color="y", scale=scale, units="xy")
+            # Plot the displacement vectors. Negate displacement_y to preserve
+            # direction after flipping the y-axis to image convention.
+            ax.quiver(x, y, displacement_x[frame_idx], -displacement_y[frame_idx], color="y", scale=scale, units="xy")
 
             # Add frame number text like "Frame: 5 / 20"
             ax.text(
@@ -167,16 +170,19 @@ def generate_displacement_quiver_gif_comparison(
                 ax.set_facecolor("black")
                 ax.set_aspect("equal")
                 ax.axis("off")
+                ax.set_xlim(0, w)
+                ax.set_ylim(h, 0)  # image convention: row 0 at top
 
-            # Plot the first displacement field
+            # Plot the first displacement field. Negate displacement_y to
+            # preserve direction after flipping the y-axis to image convention.
             axs[0].quiver(
-                x, y, displacement_x1[frame_idx], displacement_y1[frame_idx], color="y", scale=scale, units="xy"
+                x, y, displacement_x1[frame_idx], -displacement_y1[frame_idx], color="y", scale=scale, units="xy"
             )
             axs[0].set_title(titles[0], color="white")
 
             # Plot the second displacement field
             axs[1].quiver(
-                x, y, displacement_x2[frame_idx], displacement_y2[frame_idx], color="y", scale=scale, units="xy"
+                x, y, displacement_x2[frame_idx], -displacement_y2[frame_idx], color="y", scale=scale, units="xy"
             )
             axs[1].set_title(titles[1], color="white")
 
@@ -247,10 +253,14 @@ def generate_displacement_quiver_gif_predicted_reconstructed_gt(
                 ax.set_facecolor("black")
                 ax.set_aspect("equal")
                 ax.axis("off")
+                ax.set_xlim(0, w)
+                ax.set_ylim(h, 0)  # image convention: row 0 at top
 
-            axs[0].quiver(x, y, dx1[t], dy1[t], color="y", scale=scale, units="xy")
-            axs[1].quiver(x, y, dx2[t], dy2[t], color="y", scale=scale, units="xy")
-            axs[2].quiver(x, y, dx3[t], dy3[t], color="y", scale=scale, units="xy")
+            # Negate displacement_y to preserve direction after flipping the
+            # y-axis to image convention.
+            axs[0].quiver(x, y, dx1[t], -dy1[t], color="y", scale=scale, units="xy")
+            axs[1].quiver(x, y, dx2[t], -dy2[t], color="y", scale=scale, units="xy")
+            axs[2].quiver(x, y, dx3[t], -dy3[t], color="y", scale=scale, units="xy")
 
             for i in range(3):
                 axs[i].set_title(titles[i], color="white")
@@ -335,8 +345,12 @@ def generate_mask_disp_side_by_side_gif(
             # Plot 2: Displacement vectors
             ax2.set_facecolor("black")
             ax2.set_aspect("equal")
+            ax2.set_xlim(0, width)
+            ax2.set_ylim(height, 0)  # image convention: row 0 at top, matches the mask panel
+            # Negate displacement_y to preserve direction after flipping the
+            # y-axis to image convention.
             ax2.quiver(
-                x, y, displacement_x[frame_idx], displacement_y[frame_idx], color=quiver_color, scale=scale, units="xy"
+                x, y, displacement_x[frame_idx], -displacement_y[frame_idx], color=quiver_color, scale=scale, units="xy"
             )
             ax2.set_title(field_title)
             # ax2.axis('off')
