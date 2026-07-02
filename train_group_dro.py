@@ -17,9 +17,15 @@ NUM_FRAMES = 26
 BATCH_SIZE = 10
 
 # Group-DRO hyperparameters.
-DRO_ETA_Q = 0.01
-DRO_ADJUSTMENT_C = 0.0
-WEIGHT_DECAY = 0.0
+# NOTE: the group loss L_g is a MEAN over all elements (batch*C*F*H*W), so it is
+# on a small scale (typically O(0.01-1) for L2). eta_q and C must be picked for
+# THAT scale, not the paper's sum-over-pixels scale. Watch the per-group q values
+# printed each step: if they stay near 1/K, raise DRO_ETA_Q; if they collapse
+# onto a single group, lower it. 0.01 is almost always far too small here.
+DRO_ETA_Q = 1.0
+DRO_ADJUSTMENT_C = 0.0     # C: generalization-adjustment constant (0 = plain group-DRO)
+WEIGHT_DECAY = 1e-4        # lambda: L2 weight decay in the model update
+NUM_WORKERS = 4
 
 
 if not torch.cuda.is_available():
@@ -62,6 +68,7 @@ trainer = GroupDROTrainer(
     dro_eta_q=DRO_ETA_Q,
     dro_adjustment_c=DRO_ADJUSTMENT_C,
     weight_decay=WEIGHT_DECAY,
+    num_workers=NUM_WORKERS,
 )
 
 try:

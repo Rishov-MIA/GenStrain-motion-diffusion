@@ -18,6 +18,7 @@ from video_diffusion_pytorch.utils import generate_displacement_quiver_gifs_with
 from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_after_only_contour import (
     EMA,
     Trainer,
+    cycle,
     exists,
     noop,
     normalize_cond_img,
@@ -25,7 +26,12 @@ from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_after_o
 )
 
 
-# This order is also the string-match priority.
+# Disease groups we keep, in string-match PRIORITY order (first match wins).
+# A metadata "disease" string is matched by substring, so multi-label strings
+# resolve to the earliest entry found here. This is what makes e.g.
+# "LBBB & Recovered DCM" -> "LBBB" (LBBB precedes DCM below), and it is also why
+# "Healthy Pediatric" MUST come before "Healthy" (otherwise every pediatric case
+# would collapse into "Healthy").
 ALLOWED_DISEASE_GROUPS = (
     "LBBB",
     "Healthy Pediatric",
@@ -37,6 +43,12 @@ ALLOWED_DISEASE_GROUPS = (
 
 
 def disease_to_group(disease, allowed_groups=ALLOWED_DISEASE_GROUPS):
+    """Map a raw metadata disease string to one of ``allowed_groups`` or None.
+
+    Matching is case-insensitive substring matching in the order given by
+    ``allowed_groups`` (first match wins), so ordering encodes precedence for
+    multi-label strings. See ``ALLOWED_DISEASE_GROUPS`` for the rationale.
+    """
     if not isinstance(disease, str):
         return None
 
@@ -67,7 +79,6 @@ class GroupedContourDataset(data.Dataset):
         self.channels = channels
         self.num_frames = num_frames
         self.allowed_groups = tuple(allowed_groups)
-        self.cache = {}
 
         if not self.metadata_json_path.exists():
             raise FileNotFoundError(f"metadata JSON not found: {self.metadata_json_path}")
@@ -142,12 +153,12 @@ class GroupedContourDataset(data.Dataset):
     def __getitem__(self, index):
         sample = self.samples[index]
 
-        if index not in self.cache:
-            input_video_tensor = torch.from_numpy(np.load(sample["input_path"])).float()
-            contour_condition_video_tensor = torch.from_numpy(np.load(sample["contour_path"])).float()
-            self.cache[index] = (input_video_tensor, contour_condition_video_tensor)
-        else:
-            input_video_tensor, contour_condition_video_tensor = self.cache[index]
+        # No in-process dict cache: this dataset is meant to be consumed through
+        # DataLoaders with num_workers > 0, where each forked worker would keep
+        # its own copy of such a cache (unshared, unbounded memory growth). The
+        # DataLoader's prefetching gives us the overlap we care about instead.
+        input_video_tensor = torch.from_numpy(np.load(sample["input_path"])).float()
+        contour_condition_video_tensor = torch.from_numpy(np.load(sample["contour_path"])).float()
 
         return (
             input_video_tensor.squeeze(0),
@@ -156,22 +167,9 @@ class GroupedContourDataset(data.Dataset):
             sample["filename"],
         )
 
-    def sample_group_batch(self, group_idx, batch_size):
-        indices = self.group_to_indices[group_idx]
-        assert len(indices) > 0, f"group {group_idx} has no samples"
-
-        chosen = [indices[random.randrange(len(indices))] for _ in range(batch_size)]
-        input_videos = []
-        contour_condition_videos = []
-        filenames = []
-
-        for index in chosen:
-            input_video, contour_condition_video, _, filename = self[index]
-            input_videos.append(input_video)
-            contour_condition_videos.append(contour_condition_video)
-            filenames.append(filename)
-
-        return torch.stack(input_videos, dim=0), torch.stack(contour_condition_videos, dim=0), filenames
+    def indices_for_group(self, group_idx):
+        """Dataset indices belonging to a single group (for a per-group sampler)."""
+        return list(self.group_to_indices[group_idx])
 
 
 class GroupDROTrainer(Trainer):
@@ -183,8 +181,14 @@ class GroupDROTrainer(Trainer):
         contour_condition_video_dir=None,
         sampling_contour_condition_video_dir=None,
         metadata_json_path=None,
-        dro_eta_q=0.01,
-        dro_adjustment_c=0.0,
+        # DRO group-weight learning rate (eta_q in the algorithm). NOTE: the group
+        # loss L_g here is a MEAN over all elements (batch*C*F*H*W), not the paper's
+        # sum-over-pixels, so it lives on a much smaller scale. eta_q must be picked
+        # for THAT scale — the paper's value would be off by ~(C*F*H*W). With
+        # mean-based L2 losses (typically O(0.01-1)) a tiny eta_q leaves q at
+        # uniform; watch the printed per-group q and raise eta_q until they move.
+        dro_eta_q=1.0,
+        dro_adjustment_c=0.0,  # generalization-adjustment constant C (also on the mean-loss scale)
         weight_decay=0.0,
         ema_decay=0.995,
         num_frames=16,
@@ -198,6 +202,7 @@ class GroupDROTrainer(Trainer):
         save_and_sample_every=1000,
         max_grad_norm=None,
         experiment_name="test-exp",
+        num_workers=4,
         inference_only=False,
     ):
         object.__init__(self)
@@ -224,6 +229,7 @@ class GroupDROTrainer(Trainer):
         self.dro_eta_q = float(dro_eta_q)
         self.dro_adjustment_c = float(dro_adjustment_c)
         self.weight_decay = float(weight_decay)
+        self.num_workers = int(num_workers)
 
         image_size = diffusion_model.image_size
         channels = diffusion_model.channels
@@ -255,6 +261,41 @@ class GroupDROTrainer(Trainer):
                 dtype=torch.float32,
                 device=self.device,
             )
+
+            # One infinite DataLoader per group (algorithm line 4: sample B examples
+            # from a single group per step). We sample WITH REPLACEMENT via a
+            # RandomSampler(replacement=True), matching the pseudocode's i.i.d. draw
+            # and — crucially — always yielding exactly B samples even when a group
+            # has fewer than B members (drop_last=True is then a no-op since the
+            # sampler never runs out). This keeps L_g / S_g / the q-update on a
+            # consistent B for every group, and hands loading to background workers
+            # (pin_memory + prefetch) instead of blocking the train loop on disk.
+            # One loader per group stays alive for the whole run, so cap workers per
+            # group by its size to avoid spawning idle processes for tiny groups.
+            self.group_loaders = []
+            for group_idx in range(len(self.group_names)):
+                group_indices = self.ds.indices_for_group(group_idx)
+                subset = data.Subset(self.ds, group_indices)
+                workers = min(self.num_workers, len(group_indices))
+                # num_samples is just an epoch length before the sampler reshuffles
+                # its RNG draw; cycle() restarts it forever. Make it large so worker
+                # epochs are long and restart overhead is negligible.
+                sampler = data.RandomSampler(
+                    subset,
+                    replacement=True,
+                    num_samples=max(len(group_indices), self.batch_size) * 1000,
+                )
+                loader = data.DataLoader(
+                    subset,
+                    batch_size=self.batch_size,
+                    sampler=sampler,
+                    pin_memory=True,
+                    num_workers=workers,
+                    drop_last=True,
+                    persistent_workers=workers > 0,
+                )
+                self.group_loaders.append(cycle(loader))
+
             self.opt = Adam(diffusion_model.parameters(), lr=train_lr, weight_decay=self.weight_decay)
         else:
             self.group_names = []
@@ -324,6 +365,19 @@ class GroupDROTrainer(Trainer):
                 f"checkpoint={checkpoint_group_names}, current={self.group_names}"
             )
 
+        # Group names match but counts may have drifted (e.g. data added between
+        # runs). We keep the learned q from the checkpoint, but the adjustment
+        # term C/sqrt(n_g) will use the CURRENT n_g — warn so this is not silent.
+        ckpt_counts = ckpt.get("dro_group_counts")
+        if ckpt_counts is not None:
+            ckpt_counts = torch.as_tensor(ckpt_counts, dtype=torch.float32)
+            if not torch.equal(ckpt_counts.cpu(), self.group_counts.detach().cpu()):
+                print(
+                    "WARNING: DRO group counts changed since the checkpoint was saved "
+                    f"(checkpoint={ckpt_counts.tolist()}, current={self.group_counts.tolist()}). "
+                    "Keeping learned q but using current counts for the C/sqrt(n_g) adjustment."
+                )
+
         self.dro_log_q = ckpt["dro_log_q"].to(self.device, dtype=torch.float32)
 
     def sample_group_idx(self):
@@ -345,7 +399,8 @@ class GroupDROTrainer(Trainer):
             group_idx = self.sample_group_idx()
             group_name = self.group_names[group_idx]
 
-            input_video, contour_cond_video, _ = self.ds.sample_group_batch(group_idx, self.batch_size)
+            # Pull one B-sized batch from the chosen group's cycled loader.
+            input_video, contour_cond_video, _, _ = next(self.group_loaders[group_idx])
             input_video = input_video.to(self.device, non_blocking=True)
             contour_cond_video = contour_cond_video.to(self.device, non_blocking=True)
 
