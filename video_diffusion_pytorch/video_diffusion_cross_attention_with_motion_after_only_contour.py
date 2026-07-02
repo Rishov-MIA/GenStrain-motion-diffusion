@@ -932,7 +932,7 @@ class GaussianDiffusion(nn.Module):
         x0 = self.predict_start_from_noise(x_noisy, t=t, noise=x_recon)
 
         mse_disp = torch.mean((x_start - x0) ** 2)
-        print(f"MSE disp in training: {mse_disp}")
+        # print(f"MSE disp in training: {mse_disp}")
 
         if self.contour_noise_only and noise_mask is not None:
             # Compute loss only in the contour region

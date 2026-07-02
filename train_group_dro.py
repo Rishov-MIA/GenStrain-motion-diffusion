@@ -17,12 +17,14 @@ NUM_FRAMES = 26
 BATCH_SIZE = 10
 
 # Group-DRO hyperparameters.
-# NOTE: the group loss L_g is a MEAN over all elements (batch*C*F*H*W), so it is
-# on a small scale (typically O(0.01-1) for L2). eta_q and C must be picked for
-# THAT scale, not the paper's sum-over-pixels scale. Watch the per-group q values
-# printed each step: if they stay near 1/K, raise DRO_ETA_Q; if they collapse
-# onto a single group, lower it. 0.01 is almost always far too small here.
-DRO_ETA_Q = 1.0
+# The q update multiplies a group's raw weight by exp(DRO_ETA_Q * S_g), with
+# S_g ~= L_g, the MEAN denoising loss (empirically ~0.4-1.1 here). Pick DRO_ETA_Q
+# so exp(DRO_ETA_Q * L_g) stays near 1 -> ~0.01-0.05. DRO_ETA_Q=1.0 nearly doubles
+# a group's weight per sample and makes q collapse onto whichever group is sampled
+# first (observed: q -> ~1.0 on Healthy by step ~150). Watch the per-group q each
+# step: it should stay spread and drift toward the persistently-hardest group,
+# never pin near 1.0. Flat at 1/K -> raise it; any group > ~0.7 -> lower it.
+DRO_ETA_Q = 0.02
 DRO_ADJUSTMENT_C = 0.0     # C: generalization-adjustment constant (0 = plain group-DRO)
 WEIGHT_DECAY = 1e-4        # lambda: L2 weight decay in the model update
 NUM_WORKERS = 4

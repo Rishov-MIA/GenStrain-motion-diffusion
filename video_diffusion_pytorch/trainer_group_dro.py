@@ -191,13 +191,19 @@ class GroupDROTrainer(Trainer):
         contour_condition_video_dir=None,
         sampling_contour_condition_video_dir=None,
         metadata_json_path=None,
-        # DRO group-weight learning rate (eta_q in the algorithm). NOTE: the group
-        # loss L_g here is a MEAN over all elements (batch*C*F*H*W), not the paper's
-        # sum-over-pixels, so it lives on a much smaller scale. eta_q must be picked
-        # for THAT scale — the paper's value would be off by ~(C*F*H*W). With
-        # mean-based L2 losses (typically O(0.01-1)) a tiny eta_q leaves q at
-        # uniform; watch the printed per-group q and raise eta_q until they move.
-        dro_eta_q=1.0,
+        # DRO group-weight learning rate (eta_q in the algorithm). The per-step
+        # update multiplies a group's raw weight by exp(eta_q * S_g), with
+        # S_g ~= L_g (a MEAN denoising loss, empirically ~0.4-1.1 here). So the
+        # right eta_q keeps exp(eta_q * L_g) close to 1 — i.e. eta_q on the order
+        # of 0.01-0.05, NOT 1.0. With eta_q=1.0 each sample of a group ~doubles
+        # its raw weight (exp(0.6)~=1.8), so whichever group is sampled most in
+        # the first few steps runs away and q collapses onto it regardless of
+        # which group is actually hardest (observed: q -> ~1.0 on Healthy by
+        # step ~150). Tuning target: watch the printed per-group q — it should
+        # stay spread and drift toward the group with PERSISTENTLY higher loss,
+        # never pin near 1.0. If q is dead-flat at 1/K, raise eta_q; if any group
+        # exceeds ~0.7, lower it.
+        dro_eta_q=0.02,
         dro_adjustment_c=0.0,  # generalization-adjustment constant C (also on the mean-loss scale)
         weight_decay=0.0,
         ema_decay=0.995,
