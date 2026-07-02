@@ -4,6 +4,7 @@ import json
 import math
 import os
 import random
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -142,7 +143,16 @@ class GroupedContourDataset(data.Dataset):
     @staticmethod
     def _lookup_metadata(metadata, filename):
         path = Path(filename)
-        for key in (filename, f"{path.stem}.mat", path.stem):
+        stems = [path.stem]
+        cycle_base_stem = re.sub(r"_cycle[A-Za-z0-9]+$", "", path.stem)
+        if cycle_base_stem != path.stem:
+            stems.append(cycle_base_stem)
+
+        keys = [filename]
+        for stem in stems:
+            keys.extend((f"{stem}.mat", stem))
+
+        for key in keys:
             if key in metadata:
                 return metadata[key]
         return None
