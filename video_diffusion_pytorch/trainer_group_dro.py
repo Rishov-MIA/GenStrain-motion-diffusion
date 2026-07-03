@@ -205,6 +205,11 @@ class GroupDROTrainer(Trainer):
         # exceeds ~0.7, lower it.
         dro_eta_q=0.02,
         dro_adjustment_c=0.0,  # generalization-adjustment constant C (also on the mean-loss scale)
+        # Freeze q at its uniform init (1/K) and backprop the raw, UNWEIGHTED loss.
+        # This disables the DRO reweighting entirely. NOTE: it does NOT reproduce
+        # base GenStrain, because group selection is still uniform-over-groups
+        # (group-balanced sampling), not i.i.d. from the natural data distribution.
+        dro_freeze_q=False,
         weight_decay=0.0,
         ema_decay=0.995,
         num_frames=16,
@@ -244,6 +249,7 @@ class GroupDROTrainer(Trainer):
 
         self.dro_eta_q = float(dro_eta_q)
         self.dro_adjustment_c = float(dro_adjustment_c)
+        self.dro_freeze_q = bool(dro_freeze_q)
         self.weight_decay = float(weight_decay)
         self.num_workers = int(num_workers)
 
@@ -403,8 +409,9 @@ class GroupDROTrainer(Trainer):
         with torch.no_grad():
             adjustment = self.dro_adjustment_c / self.group_counts[group_idx].sqrt()
             score = group_loss.detach().float() + adjustment
-            self.dro_log_q[group_idx] = self.dro_log_q[group_idx] + self.dro_eta_q * score
-            self.dro_log_q = self.dro_log_q - torch.logsumexp(self.dro_log_q, dim=0)
+            if not self.dro_freeze_q:
+                self.dro_log_q[group_idx] = self.dro_log_q[group_idx] + self.dro_eta_q * score
+                self.dro_log_q = self.dro_log_q - torch.logsumexp(self.dro_log_q, dim=0)
             q_g = self.dro_q[group_idx].detach()
         return score.detach(), q_g
 
@@ -429,7 +436,11 @@ class GroupDROTrainer(Trainer):
                 )
 
             score, q_g = self.update_dro_weight(group_idx, loss)
-            weighted_loss = q_g * loss
+            # When q is frozen, backprop the raw loss so the gradient is not scaled
+            # by the constant 1/K (which would just shrink the effective LR). This
+            # makes each step's optimizer update match base GenStrain; only the
+            # (still group-balanced) sampling distribution differs.
+            weighted_loss = loss if self.dro_freeze_q else q_g * loss
             self.scaler.scale(weighted_loss).backward()
 
             log = {

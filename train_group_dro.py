@@ -26,6 +26,10 @@ BATCH_SIZE = 10
 # never pin near 1.0. Flat at 1/K -> raise it; any group > ~0.7 -> lower it.
 DRO_ETA_Q = 0.02
 DRO_ADJUSTMENT_C = 0.0     # C: generalization-adjustment constant (0 = plain group-DRO)
+# Freeze q at uniform (1/K) and backprop the raw loss -> disables DRO reweighting.
+# Sampling is still group-balanced (uniform-over-groups), so this is NOT identical
+# to base GenStrain's natural-distribution training. Set False for real group-DRO.
+DRO_FREEZE_Q = True
 WEIGHT_DECAY = 1e-4        # lambda: L2 weight decay in the model update
 NUM_WORKERS = 4
 
@@ -69,6 +73,7 @@ trainer = GroupDROTrainer(
     experiment_name=exp_name,
     dro_eta_q=DRO_ETA_Q,
     dro_adjustment_c=DRO_ADJUSTMENT_C,
+    dro_freeze_q=DRO_FREEZE_Q,
     weight_decay=WEIGHT_DECAY,
     num_workers=NUM_WORKERS,
 )
