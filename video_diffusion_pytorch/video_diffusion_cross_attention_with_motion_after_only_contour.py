@@ -1317,19 +1317,19 @@ class Trainer(object):
                 self.step_ema()
 
             # Save recontructed x0 every 300 steps (customize as needed)
-            if (self.step % 300 == 0) and (self.step != 0):
-                predicted_start_training_dir = f"./{self.experiment_name}/predicted_start_training_gifs"
-                os.makedirs(predicted_start_training_dir, exist_ok=True)
-                x0 = x0.detach().cpu().numpy()
-                x_start = x_start.detach().cpu().numpy()
+            # if (self.step % 300 == 0) and (self.step != 0):
+            #     predicted_start_training_dir = f"./{self.experiment_name}/predicted_start_training_gifs"
+            #     os.makedirs(predicted_start_training_dir, exist_ok=True)
+            #     x0 = x0.detach().cpu().numpy()
+            #     x_start = x_start.detach().cpu().numpy()
 
-                generate_displacement_quiver_gifs_with_gt(
-                    milestone="train",
-                    filenames=[f"train_visual_{self.step}"],
-                    pred_disp=np.expand_dims(x0[0:1], axis=0),
-                    gt_disp=np.expand_dims(x_start[0:1], axis=0),
-                    output_dir=predicted_start_training_dir,
-                )
+            #     generate_displacement_quiver_gifs_with_gt(
+            #         milestone="train",
+            #         filenames=[f"train_visual_{self.step}"],
+            #         pred_disp=np.expand_dims(x0[0:1], axis=0),
+            #         gt_disp=np.expand_dims(x_start[0:1], axis=0),
+            #         output_dir=predicted_start_training_dir,
+            #     )
 
             if self.step != 0 and self.step % self.save_and_sample_every == 0:
                 milestone = self.step // self.save_and_sample_every

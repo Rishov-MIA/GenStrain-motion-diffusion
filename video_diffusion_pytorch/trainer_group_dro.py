@@ -35,10 +35,10 @@ from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_after_o
 # would collapse into "Healthy").
 ALLOWED_DISEASE_GROUPS = (
     "LBBB",
-    "Healthy Pediatric",
-    "Acute MI",
-    "Myocarditis",
-    "DCM",
+    # "Healthy Pediatric",
+    # "Acute MI",
+    # "Myocarditis",
+    # "DCM",
     "Healthy",
 )
 
@@ -468,19 +468,19 @@ class GroupDROTrainer(Trainer):
             if self.step % self.update_ema_every == 0:
                 self.step_ema()
 
-            if (self.step % 300 == 0) and (self.step != 0):
-                predicted_start_training_dir = f"./{self.experiment_name}/predicted_start_training_gifs"
-                os.makedirs(predicted_start_training_dir, exist_ok=True)
-                x0_np = x0.detach().cpu().numpy()
-                x_start_np = x_start.detach().cpu().numpy()
+            # if (self.step % 300 == 0) and (self.step != 0):
+            #     predicted_start_training_dir = f"./{self.experiment_name}/predicted_start_training_gifs"
+            #     os.makedirs(predicted_start_training_dir, exist_ok=True)
+            #     x0_np = x0.detach().cpu().numpy()
+            #     x_start_np = x_start.detach().cpu().numpy()
 
-                generate_displacement_quiver_gifs_with_gt(
-                    milestone="train",
-                    filenames=[f"train_visual_{self.step}_{group_name}"],
-                    pred_disp=np.expand_dims(x0_np[0:1], axis=0),
-                    gt_disp=np.expand_dims(x_start_np[0:1], axis=0),
-                    output_dir=predicted_start_training_dir,
-                )
+            #     generate_displacement_quiver_gifs_with_gt(
+            #         milestone="train",
+            #         filenames=[f"train_visual_{self.step}_{group_name}"],
+            #         pred_disp=np.expand_dims(x0_np[0:1], axis=0),
+            #         gt_disp=np.expand_dims(x_start_np[0:1], axis=0),
+            #         output_dir=predicted_start_training_dir,
+            #     )
 
             if self.step != 0 and self.step % self.save_and_sample_every == 0:
                 milestone = self.step // self.save_and_sample_every
