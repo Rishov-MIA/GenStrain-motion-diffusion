@@ -1,25 +1,32 @@
 """
 Multi-GPU (single-node) DDP version of train_full_region.py.
 
-Launch with torchrun. Example for 4 GPUs on one node:
+All hyperparameters live in a JSON config (default: configs/train_full_region_ddp.json);
+see configs/README.md for what each field means. Launch with torchrun. Example
+for 4 GPUs on one node:
 
     torchrun --standalone --nproc_per_node=4 train_full_region_ddp.py
 
-For 2 GPUs:
+For 2 GPUs, with a custom config:
 
-    torchrun --standalone --nproc_per_node=2 train_full_region_ddp.py
+    torchrun --standalone --nproc_per_node=2 train_full_region_ddp.py --config configs/my_experiment_ddp.json
 
-NOTE: `train_batch_size` below is PER-GPU. With N GPUs the effective global
-batch size is `train_batch_size * N`. The single-GPU script used a global batch
-of 20. To keep the same global batch on 4 GPUs, set train_batch_size = 5; on
-2 GPUs set train_batch_size = 10. Adjust `train_lr` if you intentionally grow
-the global batch (linear LR scaling is a reasonable starting point).
+NOTE: `training.per_gpu_batch_size` is PER-GPU. With N GPUs the effective global
+batch size is `per_gpu_batch_size * N`. The single-GPU script used a global batch
+of 20. To keep the same global batch on 4 GPUs, set per_gpu_batch_size = 5; on
+2 GPUs set per_gpu_batch_size = 10. Adjust `training.lr` if you intentionally
+grow the global batch (linear LR scaling is a reasonable starting point).
 """
+
+import argparse
+import json
+from pathlib import Path
 
 from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_after_only_contour import (
     Unet3D,
     GaussianDiffusion,
 )
+from video_diffusion_pytorch.config_snapshot import save_config_snapshot
 from video_diffusion_pytorch.trainer_ddp import (
     DDPTrainer,
     setup_distributed,
@@ -27,64 +34,79 @@ from video_diffusion_pytorch.trainer_ddp import (
     is_main_process,
 )
 
+DEFAULT_CONFIG = Path(__file__).resolve().parent / "configs" / "train_full_region_ddp.json"
 
-# DATA BASE PATH
-base_path = "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_32_frames"
 
-# New data dimensions.
-IMAGE_SIZE = 64   # H == W
-NUM_FRAMES = 32
-
-# Per-GPU batch size. Effective global batch = PER_GPU_BATCH * num_gpus.
-PER_GPU_BATCH = 10
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG,
+        help="path to the JSON hyperparameter config (see configs/)",
+    )
+    return parser.parse_args()
 
 
 def main():
+    args = parse_args()
+    with args.config.open() as f:
+        cfg = json.load(f)
+
+    data_cfg = cfg["data"]
+    model_cfg = cfg["model"]
+    diffusion_cfg = cfg["diffusion"]
+    train_cfg = cfg["training"]
+
     local_rank, global_rank, world_size, device = setup_distributed()
 
+    if is_main_process():
+        save_config_snapshot(cfg, cfg["experiment_name"])
+
     model = Unet3D(
-        dim=48,
-        cond_dim=None,  # video encoder output dim
-        channels=2,
-        dim_mults=(1, 2, 4, 8),
+        dim=model_cfg["dim"],
+        cond_dim=model_cfg["cond_dim"],  # video encoder output dim
+        channels=model_cfg["channels"],
+        dim_mults=tuple(model_cfg["dim_mults"]),
     )
 
     diffusion = GaussianDiffusion(
         model,
-        image_size=IMAGE_SIZE,  # 64x64
-        channels=2,
-        num_frames=NUM_FRAMES,  # 32 frames
-        timesteps=1000,  # number of steps
-        loss_type="l2",  # L1 or L2
-        contour_noise_only=False,  # True = noise only in mask contour region, False = full image
+        image_size=diffusion_cfg["image_size"],
+        channels=diffusion_cfg["channels"],
+        num_frames=diffusion_cfg["num_frames"],
+        timesteps=diffusion_cfg["timesteps"],
+        loss_type=diffusion_cfg["loss_type"],
+        contour_noise_only=diffusion_cfg["contour_noise_only"],
     ).to(device)
 
-    exp_name = "proposal-genstrain-new-32-frames"
-    
+    base_path = Path(data_cfg["base_path"])
+
     trainer = DDPTrainer(
         diffusion_model=diffusion,
-        input_video_folder=f"{base_path}/dense/train/displacement_dense",
+        input_video_folder=str(base_path / data_cfg["input_video_subdir"]),
         local_rank=local_rank,
-        contour_condition_video_dir=f"{base_path}/dense/train/dense_mask",
-        sampling_contour_condition_video_dir=f"{base_path}/dense/test/dense_mask",
-        train_batch_size=PER_GPU_BATCH,  # PER-GPU
-        train_lr=1e-5,
-        save_and_sample_every=300,
-        train_num_steps=700000,
-        gradient_accumulate_every=1,
-        ema_decay=0.995,
-        amp=True,
-        experiment_name=exp_name,
-        num_workers=4,
+        contour_condition_video_dir=str(base_path / data_cfg["contour_condition_subdir"]),
+        sampling_contour_condition_video_dir=str(base_path / data_cfg["sampling_contour_condition_subdir"]),
+        train_batch_size=train_cfg["per_gpu_batch_size"],  # PER-GPU
+        train_lr=train_cfg["lr"],
+        save_and_sample_every=train_cfg["save_and_sample_every"],
+        train_num_steps=train_cfg["num_steps"],
+        gradient_accumulate_every=train_cfg["gradient_accumulate_every"],
+        ema_decay=train_cfg["ema_decay"],
+        amp=train_cfg["amp"],
+        experiment_name=cfg["experiment_name"],
+        num_workers=data_cfg["num_workers"],
     )
 
     # Load the latest checkpoint (milestone = -1) to resume from latest.
-    # Wrap in try/except so a fresh run (no checkpoints yet) doesn't crash.
-    try:
-        trainer.load(milestone=-1)
-    except AssertionError:
-        if is_main_process():
-            print("no checkpoint found, starting from scratch")
+    # Wrapped in try/except so a fresh run (no checkpoints yet) doesn't crash.
+    if train_cfg["resume"]:
+        try:
+            trainer.load(milestone=-1)
+        except AssertionError:
+            if is_main_process():
+                print("no checkpoint found, starting from scratch")
 
     try:
         trainer.train()

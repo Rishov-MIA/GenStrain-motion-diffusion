@@ -1,45 +1,91 @@
-import torch
-from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_only import Unet3D, GaussianDiffusion, Trainer
+"""Training conditioned on motion only (no contour mask).
 
+All hyperparameters live in a JSON config (default: configs/train_only_motion.json).
+Run a different experiment by pointing at another config:
 
-# DATA BASE PATH
-# base_path = "/scratch/vst2hb/video-diffusion-pytorch/new-data-sona-latest/all_data_resampled_20_frames-rv"
-base_path = "/scratch/vst2hb/Dataset_Processing/new-data-with-uk/all_data_resampled_20_frames-most-latest-with-uk"
-model = Unet3D(
-    dim = 48,
-    cond_dim=None,           # video encoder output dim
-    channels=2,
-    dim_mults = (1, 2, 4, 8),
+    python train_only_motion.py --config configs/my_experiment.json
+
+See configs/README.md for what each field means.
+"""
+
+import argparse
+import json
+from pathlib import Path
+
+from video_diffusion_pytorch.config_snapshot import save_config_snapshot
+from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_only import (
+    Unet3D,
+    GaussianDiffusion,
+    Trainer,
 )
 
-diffusion = GaussianDiffusion(
-    model,
-    image_size = 48,
-    channels = 2,
-    num_frames = 20,
-    timesteps = 1000,   # number of steps
-    loss_type = 'l2',   # L1 or L2
-).cuda()
-
-exp_name = "new-data-noise-full-region-cond-mask-only"
+DEFAULT_CONFIG = Path(__file__).resolve().parent / "configs" / "train_only_motion.json"
 
 
-trainer = Trainer(
-    diffusion_model=diffusion,
-    input_video_folder=f'{base_path}/dense/train/displacement_dense',
-    motion_condition_video_dir=f'{base_path}/tlrn_dense_mask_motion/train',
-    sampling_motion_condition_video_dir=f'{base_path}/tlrn_dense_mask_motion/test',
-    train_batch_size = 20,
-    train_lr = 1e-5,
-    save_and_sample_every = 500,
-    train_num_steps = 700000,         # total training steps
-    gradient_accumulate_every = 1,    # gradient accumulation steps
-    ema_decay = 0.995,                # exponential moving average decay
-    amp = True,                       # turn on mixed precision
-    experiment_name=exp_name
-)
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG,
+        help="path to the JSON hyperparameter config (see configs/)",
+    )
+    return parser.parse_args()
 
-# Load the latest checkpoint (milestone = -1) if you want to retrain from latest checkpoint
-# trainer.load(milestone=-1)
 
-trainer.train()
+def main():
+    args = parse_args()
+    with args.config.open() as f:
+        cfg = json.load(f)
+
+    data_cfg = cfg["data"]
+    model_cfg = cfg["model"]
+    diffusion_cfg = cfg["diffusion"]
+    train_cfg = cfg["training"]
+
+    save_config_snapshot(cfg, cfg["experiment_name"])
+
+    model = Unet3D(
+        dim=model_cfg["dim"],
+        cond_dim=model_cfg["cond_dim"],  # video encoder output dim
+        channels=model_cfg["channels"],
+        dim_mults=tuple(model_cfg["dim_mults"]),
+    )
+
+    diffusion = GaussianDiffusion(
+        model,
+        image_size=diffusion_cfg["image_size"],
+        channels=diffusion_cfg["channels"],
+        num_frames=diffusion_cfg["num_frames"],
+        timesteps=diffusion_cfg["timesteps"],
+        loss_type=diffusion_cfg["loss_type"],
+    ).cuda()
+
+    base_path = Path(data_cfg["base_path"])
+
+    trainer = Trainer(
+        diffusion_model=diffusion,
+        input_video_folder=str(base_path / data_cfg["input_video_subdir"]),
+        motion_condition_video_dir=str(base_path / data_cfg["motion_condition_subdir"]),
+        sampling_motion_condition_video_dir=str(base_path / data_cfg["sampling_motion_condition_subdir"]),
+        train_batch_size=train_cfg["batch_size"],
+        train_lr=train_cfg["lr"],
+        save_and_sample_every=train_cfg["save_and_sample_every"],
+        train_num_steps=train_cfg["num_steps"],
+        gradient_accumulate_every=train_cfg["gradient_accumulate_every"],
+        ema_decay=train_cfg["ema_decay"],
+        amp=train_cfg["amp"],
+        experiment_name=cfg["experiment_name"],
+    )
+
+    if train_cfg["resume"]:
+        try:
+            trainer.load(milestone=-1)
+        except AssertionError:
+            print("no checkpoint found, starting from scratch")
+
+    trainer.train()
+
+
+if __name__ == "__main__":
+    main()
