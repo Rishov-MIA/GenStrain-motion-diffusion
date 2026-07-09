@@ -1,0 +1,32 @@
+{
+    "experiment_name": "new-data-noise-full-region-cond-mask-only",
+    "data": {
+        "base_path": "/scratch/vst2hb/Dataset_Processing/new-data-with-uk/all_data_resampled_20_frames-most-latest-with-uk",
+        "input_video_subdir": "dense/train/displacement_dense",
+        "motion_condition_subdir": "tlrn_dense_mask_motion/train",
+        "sampling_motion_condition_subdir": "tlrn_dense_mask_motion/test"
+    },
+    "model": {
+        "dim": 48,
+        "cond_dim": null,
+        "channels": 2,
+        "dim_mults": [1, 2, 4, 8]
+    },
+    "diffusion": {
+        "image_size": 48,
+        "num_frames": 20,
+        "channels": 2,
+        "timesteps": 1000,
+        "loss_type": "l2"
+    },
+    "training": {
+        "batch_size": 20,
+        "lr": 1e-5,
+        "num_steps": 700000,
+        "gradient_accumulate_every": 1,
+        "ema_decay": 0.995,
+        "amp": true,
+        "save_and_sample_every": 500,
+        "resume": false
+    }
+}

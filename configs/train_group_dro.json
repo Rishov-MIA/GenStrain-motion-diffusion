@@ -1,0 +1,41 @@
+{
+    "experiment_name": "proposal-genstrain-new-26-frames-group-dro",
+    "data": {
+        "base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames",
+        "metadata_json_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/processed_excel.json",
+        "input_video_subdir": "dense/train/displacement_dense",
+        "contour_condition_subdir": "dense/train/dense_mask",
+        "sampling_contour_condition_subdir": "dense/test/dense_mask",
+        "num_workers": 4
+    },
+    "model": {
+        "dim": 48,
+        "cond_dim": null,
+        "channels": 2,
+        "dim_mults": [1, 2, 4, 8]
+    },
+    "diffusion": {
+        "image_size": 64,
+        "num_frames": 26,
+        "channels": 2,
+        "timesteps": 1000,
+        "loss_type": "l2",
+        "contour_noise_only": false
+    },
+    "training": {
+        "batch_size": 10,
+        "lr": 1e-5,
+        "num_steps": 700000,
+        "gradient_accumulate_every": 1,
+        "ema_decay": 0.995,
+        "amp": true,
+        "save_and_sample_every": 300,
+        "weight_decay": 1e-5,
+        "resume": true
+    },
+    "dro": {
+        "eta_q": 0.02,
+        "adjustment_c": 0.0,
+        "freeze_q": true
+    }
+}
