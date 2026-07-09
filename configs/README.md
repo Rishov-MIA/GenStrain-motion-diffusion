@@ -14,6 +14,7 @@ torchrun --standalone --nproc_per_node=4 train_group_dro_ddp.py --config configs
 | --- | --- | --- |
 | `train.json` | `train.py` | contour-region noise, contour condition |
 | `train_full_region.json` | `train_full_region.py` | full-region noise, contour condition |
+| `train_full_region_augmented.json` | `train_full_region_augmented.py` | full-region noise, contour condition, augmented data (`--aug N` selects `aug_Nx`) |
 | `train_full_region_ddp.json` | `train_full_region_ddp.py` | full-region noise, contour condition, multi-GPU |
 | `train_both_contour_motion.json` | `train_both_contour_motion.py` | contour-region noise, contour + motion conditions |
 | `train_both_contour_motion_full_region.json` | `train_both_contour_motion_full_region.py` | full-region noise, contour + motion conditions |
@@ -42,6 +43,16 @@ In DDP only rank 0 writes.
   form the input video, contour-condition, motion-condition, and sampling
   condition folders. Scripts only read the subdir keys they use (e.g. only
   the `both_contour_motion` and `only_motion` configs have `motion_*` keys).
+- `aug_subdir` — augmented config only. Sits between `base_path` and the split
+  subdirs. It is a template containing `{aug}` (e.g. `"aug_{aug}x"`); the
+  required `--aug N` flag on `train_full_region_augmented.py` fills it in
+  (`--aug 5` → `aug_5x`) and also substitutes `{aug}` anywhere else in the
+  config (e.g. `experiment_name`), so each augmentation count writes to its own
+  checkpoint folder. Nothing on disk is mutated. Example:
+
+  ```bash
+  python train_full_region_augmented.py --aug 5
+  ```
 - `metadata_json_path` — Group-DRO only: the processed Excel metadata JSON
   (disease groups).
 - `num_workers` — DataLoader workers (DDP and Group-DRO trainers only; the

@@ -1,7 +1,7 @@
 {
     "experiment_name": "new-data-noise-full-region-cond-mask-motion-both",
     "data": {
-        "base_path": "/scratch/vst2hb/Dataset_Processing/new-data-with-uk/all_data_resampled_20_frames-most-latest-with-uk",
+        "base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames",
         "input_video_subdir": "dense/train/displacement_dense",
         "contour_condition_subdir": "dense/train/dense_mask",
         "motion_condition_subdir": "tlrn_dense_mask_motion/train",
@@ -12,19 +12,24 @@
         "dim": 48,
         "cond_dim": null,
         "channels": 2,
-        "dim_mults": [1, 2, 4, 8]
+        "dim_mults": [
+            1,
+            2,
+            4,
+            8
+        ]
     },
     "diffusion": {
-        "image_size": 48,
-        "num_frames": 20,
+        "image_size": 64,
+        "num_frames": 26,
         "channels": 2,
         "timesteps": 1000,
         "loss_type": "l2",
         "contour_noise_only": false
     },
     "training": {
-        "batch_size": 20,
-        "lr": 1e-5,
+        "batch_size": 16,
+        "lr": 1e-05,
         "num_steps": 700000,
         "gradient_accumulate_every": 1,
         "ema_decay": 0.995,

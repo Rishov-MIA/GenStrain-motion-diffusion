@@ -12,7 +12,12 @@
         "dim": 48,
         "cond_dim": null,
         "channels": 2,
-        "dim_mults": [1, 2, 4, 8]
+        "dim_mults": [
+            1,
+            2,
+            4,
+            8
+        ]
     },
     "diffusion": {
         "image_size": 64,
@@ -23,14 +28,14 @@
         "contour_noise_only": false
     },
     "training": {
-        "batch_size": 10,
-        "lr": 1e-5,
+        "batch_size": 16,
+        "lr": 1e-05,
         "num_steps": 700000,
         "gradient_accumulate_every": 1,
         "ema_decay": 0.995,
         "amp": true,
         "save_and_sample_every": 300,
-        "weight_decay": 1e-5,
+        "weight_decay": 1e-05,
         "resume": true
     },
     "dro": {
