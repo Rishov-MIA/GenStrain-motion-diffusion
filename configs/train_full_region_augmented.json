@@ -1,7 +1,7 @@
 {
     "experiment_name": "new-data-noise-full-region-cond-mask-only-aug_{aug}x",
     "data": {
-        "base_path": "/scratch/vst2hb/Dataset_Processing/new-data-with-uk/all_data_resampled_26_frames_augmented",
+        "base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames",
         "aug_subdir": "aug_{aug}x",
         "input_video_subdir": "dense/train/displacement_dense",
         "contour_condition_subdir": "dense/train/dense_mask",
