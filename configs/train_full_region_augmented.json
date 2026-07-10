@@ -5,6 +5,7 @@
         "aug_subdir": "aug_{aug}x",
         "input_video_subdir": "dense/train/displacement_dense",
         "contour_condition_subdir": "dense/train/dense_mask",
+        "sampling_base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames_by_disease_all",
         "sampling_contour_condition_subdir": "dense/test/dense_mask"
     },
     "model": {

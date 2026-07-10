@@ -53,6 +53,11 @@ In DDP only rank 0 writes.
   ```bash
   python train_full_region_augmented.py --aug 5
   ```
+- `sampling_base_path` — augmented config only, optional. Dataset root for the
+  sampling condition folder(s), used instead of `base_path`/`aug_subdir`. Set it
+  when sampling should draw from a separate (e.g. non-augmented) dataset — the
+  `sampling_*_subdir` entries are joined onto this path. When absent, sampling
+  falls back to the augmented `data_root` (`base_path`/`aug_subdir`).
 - `metadata_json_path` — Group-DRO only: the processed Excel metadata JSON
   (disease groups).
 - `num_workers` — DataLoader workers (DDP and Group-DRO trainers only; the

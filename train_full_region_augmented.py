@@ -93,11 +93,15 @@ def main():
     # aug_subdir (e.g. "aug_5x") sits between the dataset root and the split subdirs.
     data_root = Path(data_cfg["base_path"]) / data_cfg["aug_subdir"]
 
+    # Sampling conditions can come from a separate (non-augmented) dataset root.
+    # Falls back to the augmented data_root when sampling_base_path is absent.
+    sampling_root = Path(data_cfg.get("sampling_base_path", str(data_root)))
+
     trainer = Trainer(
         diffusion_model=diffusion,
         input_video_folder=str(data_root / data_cfg["input_video_subdir"]),
         contour_condition_video_dir=str(data_root / data_cfg["contour_condition_subdir"]),
-        sampling_contour_condition_video_dir=str(data_root / data_cfg["sampling_contour_condition_subdir"]),
+        sampling_contour_condition_video_dir=str(sampling_root / data_cfg["sampling_contour_condition_subdir"]),
         train_batch_size=train_cfg["batch_size"],
         train_lr=train_cfg["lr"],
         save_and_sample_every=train_cfg["save_and_sample_every"],
