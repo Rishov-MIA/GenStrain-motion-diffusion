@@ -968,8 +968,11 @@ class GaussianDiffusion(nn.Module):
         # forward x0 print from predicted noise x_recon
         x0 = self.predict_start_from_noise(x_noisy, t=t, noise=x_recon)
 
-        mse_disp = torch.mean((x_start - x0) ** 2)
-        print(f"MSE disp in training: {mse_disp}")
+        # Reconstruction MSE between the ground-truth displacement field (x_start)
+        # and the model's predicted x0, in normalized space. This measures the
+        # actual displacement-prediction quality, distinct from `loss` (the
+        # noise-prediction objective the model is trained on).
+        disp_recon_mse = torch.mean((x_start - x0) ** 2)
 
         if self.contour_noise_only and noise_mask is not None:
             # Compute loss only in the contour region
@@ -990,7 +993,7 @@ class GaussianDiffusion(nn.Module):
             else:
                 raise NotImplementedError()
 
-        return loss, unnormalize_divide_by_5(x0), unnormalize_divide_by_5(x_start)
+        return loss, unnormalize_divide_by_5(x0), unnormalize_divide_by_5(x_start), disp_recon_mse
         
     def forward(self, x, cond=None, *args, **kwargs):
         # cond type: [contour_cond_video, motion_cond_video]
@@ -1322,12 +1325,33 @@ class Trainer(object):
                 config=wandb_config,
                 resume="allow",
             )
+            # Plot the epoch metrics against epoch number (not step): each gets its
+            # own panel with `epoch` as the x-axis. Step-level metrics (loss,
+            # loss_cummean, disp_recon_mse) keep the default global-step axis.
+            wandb.define_metric("epoch")
+            wandb.define_metric("epoch_loss", step_metric="epoch")
+            wandb.define_metric("epoch_disp_recon_mse", step_metric="epoch")
 
         # True cumulative mean-since-start of the training loss: running sum +
         # count, so cumulative_mean = sum / count. Not checkpointed (restarts from
         # zero on resume).
         self._loss_sum = 0.0
         self._loss_count = 0
+
+        # ---- epoch loss bookkeeping ----
+        # One epoch = the model has seen the whole dataset once. Every optimizer
+        # step consumes batch_size * gradient_accumulate_every samples, so:
+        if not inference_only:
+            samples_per_step = self.batch_size * self.gradient_accumulate_every
+            self.steps_per_epoch = max(1, len(self.ds) // samples_per_step)
+        else:
+            self.steps_per_epoch = None
+        # Running sums of the per-step loss and displacement-reconstruction MSE
+        # within the current epoch, plus how many steps have contributed. Reset at
+        # each epoch boundary. (Both share _epoch_step_count as the denominator.)
+        self._epoch_loss_sum = 0.0
+        self._epoch_disp_recon_mse_sum = 0.0
+        self._epoch_step_count = 0
 
         checkpoints_folder = f"./{self.experiment_name}/checkpoints"
         self.checkpoints_folder = Path(checkpoints_folder)
@@ -1373,6 +1397,25 @@ class Trainer(object):
     def train(self, prob_focus_present=0.0, focus_present_mask=None, log_fn=noop):
         assert callable(log_fn)
 
+        # Horizontal progress bar for the current epoch. It fills as steps within
+        # the epoch complete and resets at each epoch boundary. The bar's fill and
+        # the epoch-loss average share one counter (self._epoch_step_count), so they
+        # always reset together. On a resume both start at 0 and the bar restarts
+        # the current epoch from the beginning (the loss of earlier steps in that
+        # epoch is unrecoverable anyway); the epoch NUMBER still reflects the
+        # restored step so labels stay correct.
+        current_epoch = self.step // self.steps_per_epoch
+        self._epoch_loss_sum = 0.0
+        self._epoch_disp_recon_mse_sum = 0.0
+        self._epoch_step_count = 0
+        epoch_bar = tqdm(
+            total=self.steps_per_epoch,
+            desc=f"epoch {current_epoch}",
+            unit="step",
+            leave=True,
+            dynamic_ncols=True,
+        )
+
         while self.step < self.train_num_steps:
             for i in range(self.gradient_accumulate_every):
                 input_video, contour_cond_video, motion_cond_video = next(self.dl)
@@ -1381,7 +1424,7 @@ class Trainer(object):
                 motion_cond_video = motion_cond_video.cuda()
 
                 with autocast(enabled=self.amp):
-                    loss, x0, x_start = self.model(
+                    loss, x0, x_start, disp_recon_mse = self.model(
                         input_video,
                         cond=[contour_cond_video, motion_cond_video],
                         prob_focus_present=prob_focus_present,
@@ -1390,7 +1433,11 @@ class Trainer(object):
 
                     self.scaler.scale(loss / self.gradient_accumulate_every).backward()
 
-                print(f"{self.step}: {loss.item()}")
+                # Route through the bar's writer so per-step loss lines scroll above
+                # the pinned epoch progress bar instead of fighting it.
+                epoch_bar.write(
+                    f"{self.step}: {loss.item()} | disp_recon_mse: {disp_recon_mse.item()}"
+                )
 
             # Accumulate the true cumulative mean of the loss since the start.
             self._loss_sum += loss.item()
@@ -1399,8 +1446,34 @@ class Trainer(object):
             log = {
                 "loss": loss.item(),
                 "loss_cummean": self._loss_sum / self._loss_count,
+                "disp_recon_mse": disp_recon_mse.item(),
                 "step": self.step,
             }
+
+            # Accumulate the epoch loss / disp_recon_mse and advance the epoch bar.
+            # When the current step completes a full pass over the dataset, emit the
+            # means, then reset the bar and counters for the next epoch.
+            self._epoch_loss_sum += loss.item()
+            self._epoch_disp_recon_mse_sum += disp_recon_mse.item()
+            self._epoch_step_count += 1
+            epoch_bar.update(1)
+            epoch_bar.set_postfix(loss=loss.item())
+            if self._epoch_step_count >= self.steps_per_epoch:
+                epoch_loss = self._epoch_loss_sum / self._epoch_step_count
+                epoch_disp_recon_mse = self._epoch_disp_recon_mse_sum / self._epoch_step_count
+                epoch = (self.step + 1) // self.steps_per_epoch
+                epoch_bar.write(
+                    f"  epoch {epoch} | epoch_loss {epoch_loss} | "
+                    f"epoch_disp_recon_mse {epoch_disp_recon_mse}"
+                )
+                log["epoch"] = epoch
+                log["epoch_loss"] = epoch_loss
+                log["epoch_disp_recon_mse"] = epoch_disp_recon_mse
+                epoch_bar.reset()
+                epoch_bar.set_description(f"epoch {epoch + 1}")
+                self._epoch_loss_sum = 0.0
+                self._epoch_disp_recon_mse_sum = 0.0
+                self._epoch_step_count = 0
 
             if exists(self.max_grad_norm):
                 self.scaler.unscale_(self.opt)
@@ -1460,6 +1533,8 @@ class Trainer(object):
 
             log_fn(log)
             self.step += 1
+
+        epoch_bar.close()
 
         if self.use_wandb:
             wandb.finish()

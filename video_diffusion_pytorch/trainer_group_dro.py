@@ -454,7 +454,7 @@ class GroupDROTrainer(Trainer):
             contour_cond_video = contour_cond_video.to(self.device, non_blocking=True)
 
             with autocast(enabled=self.amp):
-                loss, x0, x_start = self.model(
+                loss, x0, x_start, disp_recon_mse = self.model(
                     input_video,
                     cond=[contour_cond_video],
                     prob_focus_present=prob_focus_present,
@@ -472,6 +472,7 @@ class GroupDROTrainer(Trainer):
             log = {
                 "loss": loss.item(),
                 "weighted_loss": weighted_loss.item(),
+                "disp_recon_mse": disp_recon_mse.item(),
                 "dro_score": score.item(),
                 "dro_q": q_g.item(),
                 "group": group_name,
@@ -480,7 +481,8 @@ class GroupDROTrainer(Trainer):
             q_parts = ", ".join(f"{name}={q:.4f}" for name, q in zip(self.group_names, self.dro_q.detach().cpu()))
             print(
                 f"{self.step}: group={group_name} "
-                f"loss={loss.item():.6f} weighted={weighted_loss.item():.6f} q={q_g.item():.6f} | {q_parts}"
+                f"loss={loss.item():.6f} weighted={weighted_loss.item():.6f} "
+                f"disp_recon_mse={disp_recon_mse.item():.6f} q={q_g.item():.6f} | {q_parts}"
             )
 
             if exists(self.max_grad_norm):

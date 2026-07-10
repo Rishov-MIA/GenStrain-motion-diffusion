@@ -24,6 +24,8 @@ import os
 import copy
 import inspect
 
+from tqdm import tqdm
+
 import torch
 from torch import nn
 from torch.optim import Adam
@@ -193,11 +195,34 @@ class DDPTrainer(Trainer):
                 config=kwargs.get("wandb_config"),
                 resume="allow",
             )
+            # Plot the epoch metrics against epoch number (not step): each gets its
+            # own panel with `epoch` as the x-axis. Step-level metrics (loss,
+            # loss_cummean, disp_recon_mse) keep the default global-step axis.
+            wandb.define_metric("epoch")
+            wandb.define_metric("epoch_loss", step_metric="epoch")
+            wandb.define_metric("epoch_disp_recon_mse", step_metric="epoch")
 
         # True cumulative mean-since-start of the training loss (rank 0 uses the
         # local loss, matching the console print). Not checkpointed.
         self._loss_sum = 0.0
         self._loss_count = 0
+
+        # ---- epoch loss bookkeeping ----
+        # One epoch = the model has seen the whole dataset once. With
+        # DistributedSampler(drop_last=True) each rank sees len(ds)//world_size
+        # samples, and every optimizer step consumes
+        # per_gpu_batch_size * world_size * gradient_accumulate_every samples, so:
+        if not inference_only:
+            global_batch = self.batch_size * self.world_size * self.gradient_accumulate_every
+            self.steps_per_epoch = max(1, len(self.ds) // global_batch)
+        else:
+            self.steps_per_epoch = None
+        # Running sums of the (globally-averaged) per-step loss and disp_recon_mse
+        # within the current epoch, and how many steps have contributed. Reset at
+        # each epoch boundary. (Both share _epoch_step_count as the denominator.)
+        self._epoch_loss_sum = 0.0
+        self._epoch_disp_recon_mse_sum = 0.0
+        self._epoch_step_count = 0
 
         from pathlib import Path
 
@@ -269,6 +294,27 @@ class DDPTrainer(Trainer):
     def train(self, prob_focus_present=0.0, focus_present_mask=None, log_fn=noop):
         assert callable(log_fn)
 
+        # Rank-0-only horizontal progress bar for the current epoch. It fills as
+        # steps within the epoch complete and resets at each epoch boundary. The
+        # bar's fill and the epoch-loss average share one counter
+        # (self._epoch_step_count), so they always reset together. On a resume both
+        # start at 0 and the bar restarts the current epoch from the beginning (the
+        # loss of earlier steps in that epoch is unrecoverable anyway); the epoch
+        # NUMBER still reflects the restored step so labels stay correct.
+        epoch_bar = None
+        current_epoch = self.step // self.steps_per_epoch
+        self._epoch_loss_sum = 0.0
+        self._epoch_disp_recon_mse_sum = 0.0
+        self._epoch_step_count = 0
+        if is_main_process():
+            epoch_bar = tqdm(
+                total=self.steps_per_epoch,
+                desc=f"epoch {current_epoch}",
+                unit="step",
+                leave=True,
+                dynamic_ncols=True,
+            )
+
         while self.step < self.train_num_steps:
             # Reshuffle the shard each "epoch-ish" so ranks don't repeat order.
             if hasattr(self, "sampler"):
@@ -289,7 +335,7 @@ class DDPTrainer(Trainer):
 
                 with sync_ctx:
                     with autocast(enabled=self.amp):
-                        loss, _, _ = self.ddp_model(
+                        loss, _, _, disp_recon_mse = self.ddp_model(
                             input_video,
                             cond=[contour_cond_video],
                             prob_focus_present=prob_focus_present,
@@ -297,16 +343,65 @@ class DDPTrainer(Trainer):
                         )
                         self.scaler.scale(loss / self.gradient_accumulate_every).backward()
 
-            if is_main_process():
-                print(f"{self.step}: {loss.item()}")
+            # Globally-averaged loss across all ranks (true global-batch loss),
+            # used for the epoch loss. all_reduce over a detached copy so it never
+            # touches autograd. Falls back to the local loss when not distributed.
+            # The displacement reconstruction MSE is averaged the same way.
+            if is_dist():
+                global_loss_t = loss.detach().clone()
+                torch.distributed.all_reduce(global_loss_t, op=torch.distributed.ReduceOp.SUM)
+                global_loss = global_loss_t.item() / self.world_size
 
-            log = {"loss": loss.item(), "step": self.step}
+                disp_mse_t = disp_recon_mse.detach().clone()
+                torch.distributed.all_reduce(disp_mse_t, op=torch.distributed.ReduceOp.SUM)
+                global_disp_recon_mse = disp_mse_t.item() / self.world_size
+            else:
+                global_loss = loss.item()
+                global_disp_recon_mse = disp_recon_mse.item()
+
+            # Per-step loss line. Route through the bar's writer so it scrolls
+            # above the pinned epoch progress bar instead of fighting it.
+            if is_main_process():
+                epoch_bar.write(
+                    f"{self.step}: {loss.item()} | disp_recon_mse: {global_disp_recon_mse}"
+                )
+
+            log = {"loss": loss.item(), "disp_recon_mse": global_disp_recon_mse, "step": self.step}
             # Cumulative mean of the loss since start (rank 0 only; it's the sole
             # consumer of `log` via wandb, and only rank 0 logs).
             if is_main_process():
                 self._loss_sum += loss.item()
                 self._loss_count += 1
                 log["loss_cummean"] = self._loss_sum / self._loss_count
+
+            # Accumulate the epoch loss / disp_recon_mse on every step (all ranks
+            # stay in sync on the global values; only rank 0 logs them) and advance
+            # the epoch bar. When the current step completes a full pass over the
+            # dataset, emit the means, then reset the bar and counters for the next
+            # epoch.
+            self._epoch_loss_sum += global_loss
+            self._epoch_disp_recon_mse_sum += global_disp_recon_mse
+            self._epoch_step_count += 1
+            if is_main_process():
+                epoch_bar.update(1)
+                epoch_bar.set_postfix(loss=global_loss)
+            if self._epoch_step_count >= self.steps_per_epoch:
+                epoch_loss = self._epoch_loss_sum / self._epoch_step_count
+                epoch_disp_recon_mse = self._epoch_disp_recon_mse_sum / self._epoch_step_count
+                epoch = (self.step + 1) // self.steps_per_epoch
+                if is_main_process():
+                    epoch_bar.write(
+                        f"  epoch {epoch} | epoch_loss {epoch_loss} | "
+                        f"epoch_disp_recon_mse {epoch_disp_recon_mse}"
+                    )
+                    log["epoch"] = epoch
+                    log["epoch_loss"] = epoch_loss
+                    log["epoch_disp_recon_mse"] = epoch_disp_recon_mse
+                    epoch_bar.reset()
+                    epoch_bar.set_description(f"epoch {epoch + 1}")
+                self._epoch_loss_sum = 0.0
+                self._epoch_disp_recon_mse_sum = 0.0
+                self._epoch_step_count = 0
 
             if exists(self.max_grad_norm):
                 self.scaler.unscale_(self.opt)
@@ -350,6 +445,9 @@ class DDPTrainer(Trainer):
             # which can take a while, doesn't desync gradient all-reduces).
             if is_dist():
                 torch.distributed.barrier()
+
+        if is_main_process() and epoch_bar is not None:
+            epoch_bar.close()
 
         if self.use_wandb:
             wandb.finish()

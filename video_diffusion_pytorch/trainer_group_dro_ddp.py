@@ -391,7 +391,7 @@ class GroupDRODDPTrainer(GroupDROTrainer):
             contour_cond_video = contour_cond_video.to(self.device, non_blocking=True)
 
             with autocast(enabled=self.amp):
-                loss, x0, x_start = self.ddp_model(
+                loss, x0, x_start, disp_recon_mse = self.ddp_model(
                     input_video,
                     cond=[contour_cond_video],
                     prob_focus_present=prob_focus_present,
@@ -401,6 +401,8 @@ class GroupDRODDPTrainer(GroupDROTrainer):
             # Global L_g = mean of per-rank losses. Update q identically on every
             # rank so dro_log_q / q_g stay in lockstep and the model step matches.
             global_loss = self._global_group_loss(loss)
+            # Displacement reconstruction MSE, averaged across ranks the same way.
+            global_disp_recon_mse = self._global_group_loss(disp_recon_mse)
             score, q_g = self.update_dro_weight(group_idx, global_loss)
 
             # Backward on q_g * local_loss. DDP averages grads across ranks, giving
@@ -412,6 +414,7 @@ class GroupDRODDPTrainer(GroupDROTrainer):
             log = {
                 "loss": global_loss.item(),
                 "weighted_loss": weighted_loss.item(),
+                "disp_recon_mse": global_disp_recon_mse.item(),
                 "dro_score": score.item(),
                 "dro_q": q_g.item(),
                 "group": group_name,
@@ -422,7 +425,7 @@ class GroupDRODDPTrainer(GroupDROTrainer):
                 print(
                     f"{self.step}: group={group_name} "
                     f"loss={global_loss.item():.6f} weighted={weighted_loss.item():.6f} "
-                    f"q={q_g.item():.6f} | {q_parts}"
+                    f"disp_recon_mse={global_disp_recon_mse.item():.6f} q={q_g.item():.6f} | {q_parts}"
                 )
 
             if exists(self.max_grad_norm):
