@@ -194,6 +194,11 @@ class DDPTrainer(Trainer):
                 resume="allow",
             )
 
+        # True cumulative mean-since-start of the training loss (rank 0 uses the
+        # local loss, matching the console print). Not checkpointed.
+        self._loss_sum = 0.0
+        self._loss_count = 0
+
         from pathlib import Path
 
         checkpoints_folder = f"./{self.experiment_name}/checkpoints"
@@ -296,6 +301,12 @@ class DDPTrainer(Trainer):
                 print(f"{self.step}: {loss.item()}")
 
             log = {"loss": loss.item(), "step": self.step}
+            # Cumulative mean of the loss since start (rank 0 only; it's the sole
+            # consumer of `log` via wandb, and only rank 0 logs).
+            if is_main_process():
+                self._loss_sum += loss.item()
+                self._loss_count += 1
+                log["loss_cummean"] = self._loss_sum / self._loss_count
 
             if exists(self.max_grad_norm):
                 self.scaler.unscale_(self.opt)

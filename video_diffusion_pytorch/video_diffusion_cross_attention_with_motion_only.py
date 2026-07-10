@@ -1188,6 +1188,12 @@ class Trainer(object):
                 resume="allow",
             )
 
+        # True cumulative mean-since-start of the training loss: running sum +
+        # count, so cumulative_mean = sum / count. Not checkpointed (restarts from
+        # zero on resume).
+        self._loss_sum = 0.0
+        self._loss_count = 0
+
         checkpoints_folder = f"./{self.experiment_name}/checkpoints"
         self.checkpoints_folder = Path(checkpoints_folder)
         self.checkpoints_folder.mkdir(exist_ok=True, parents=True)
@@ -1250,7 +1256,15 @@ class Trainer(object):
 
                 print(f"{self.step}: {loss.item()}")
 
-            log = {"loss": loss.item(), "step": self.step}
+            # Accumulate the true cumulative mean of the loss since the start.
+            self._loss_sum += loss.item()
+            self._loss_count += 1
+
+            log = {
+                "loss": loss.item(),
+                "loss_cummean": self._loss_sum / self._loss_count,
+                "step": self.step,
+            }
 
             if exists(self.max_grad_norm):
                 self.scaler.unscale_(self.opt)

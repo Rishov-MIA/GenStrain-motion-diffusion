@@ -193,6 +193,10 @@ class GroupDRODDPTrainer(GroupDROTrainer):
 
             self.group_names = list(self.ds.group_names)
             self.group_counts = torch.tensor(self.ds.group_counts, dtype=torch.float32, device=self.device)
+            # True cumulative mean-since-start per group: running sum + count, fed
+            # the GLOBAL group loss (identical across ranks); only rank 0 logs it.
+            self._group_loss_sum = {name: 0.0 for name in self.group_names}
+            self._group_loss_count = {name: 0 for name in self.group_names}
             self.dro_log_q = torch.full(
                 (len(self.group_names),),
                 -math.log(len(self.group_names)),
@@ -466,13 +470,27 @@ class GroupDRODDPTrainer(GroupDROTrainer):
                         save_folder=f"./{self.experiment_name}/sampled_videos_infos",
                     )
 
-            if self.use_wandb:
-                # Log the scalar fields plus a per-group q_<name> curve; skip the
+            if self.use_wandb:  # rank 0 only
+                # Accumulate the true cumulative mean for the group sampled this
+                # step, using the GLOBAL group loss.
+                step_loss = global_loss.item()
+                self._group_loss_sum[group_name] += step_loss
+                self._group_loss_count[group_name] += 1
+
+                # Log the scalar fields plus per-group q_<name> curves; skip the
                 # string "group" field (wandb can't plot it).
                 wandb_log = {k: v for k, v in log.items() if k != "group"}
                 wandb_log["step"] = self.step
                 for name, q in zip(self.group_names, self.dro_q.detach().cpu().tolist()):
                     wandb_log[f"q_{name}"] = q
+                # Raw GLOBAL loss for the group sampled THIS step (sparse per group),
+                # plus the true cumulative mean since start for EVERY group (dense,
+                # carried forward every step).
+                wandb_log[f"loss_{group_name}"] = step_loss
+                for name in self.group_names:
+                    count = self._group_loss_count[name]
+                    if count > 0:
+                        wandb_log[f"loss_{name}_cummean"] = self._group_loss_sum[name] / count
                 wandb.log(wandb_log, step=self.step)
 
             log_fn(log)

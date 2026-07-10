@@ -105,10 +105,20 @@ In DDP only rank 0 writes.
 Weights & Biases loss monitoring. The whole block is optional — omit it and
 logging stays off (the code defaults to `use_wandb=false`). Console per-step
 loss printing is unaffected either way.
-- `use_wandb` — true = stream the per-step loss (and, for Group-DRO, the
-  `weighted_loss`, `dro_score`, `dro_q`, and a per-group `q_<group>` curve) to
-  wandb. Requires `pip install wandb` and a one-time `wandb login`. In the DDP
-  trainers only rank 0 logs. Defaults to false.
+- `use_wandb` — true = stream training loss to wandb. Requires
+  `pip install wandb` and a one-time `wandb login`. In the DDP trainers only
+  rank 0 logs. Defaults to false. Every trainer logs, per step, the raw `loss`
+  and `loss_cummean` (the true cumulative mean of the loss since the start of
+  the run — `sum / count` — a smooth trend line). For Group-DRO it additionally
+  logs `weighted_loss`, `dro_score`, `dro_q`, a per-group weight curve
+  `q_<group>`, and per-group loss curves — `loss_<group>` (the raw loss on the
+  step that group was sampled, so each such series is sparse) and
+  `loss_<group>_cummean` (the group's cumulative mean loss, dense/carried
+  forward). To compare how hard each group is / whether the hard ones are
+  improving, watch the `loss_<group>_cummean` curves. NOTE: the cumulative-mean
+  accumulators are not checkpointed, so they restart from zero when you resume a
+  run. (In DDP the per-group loss is the GLOBAL group loss all-reduced across
+  ranks.)
 - `wandb_project` — wandb project name the run is created under. The run is
   named after `experiment_name`, and `resume="allow"` continues the same-named
   run when you restart from a checkpoint. Defaults to
