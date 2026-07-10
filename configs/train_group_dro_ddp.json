@@ -42,5 +42,9 @@
         "eta_q": 0.02,
         "adjustment_c": 0.0,
         "freeze_q": false
+    },
+    "logging": {
+        "use_wandb": false,
+        "wandb_project": "genstrain-motion-diffusion"
     }
 }

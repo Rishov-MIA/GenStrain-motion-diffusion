@@ -22,6 +22,11 @@ from einops_exts import check_shape, rearrange_many
 
 from rotary_embedding_torch import RotaryEmbedding
 
+try:
+    import wandb
+except ImportError:  # wandb is optional; training works without it
+    wandb = None
+
 from video_diffusion_pytorch.utils import (
     generate_displacement_gridplot_gifs,
     generate_displacement_quiver_gifs,
@@ -1257,6 +1262,9 @@ class Trainer(object):
         max_grad_norm=None,
         experiment_name="test-exp",
         inference_only=False,
+        use_wandb=False,
+        wandb_project="genstrain-motion-diffusion",
+        wandb_config=None,
     ):
         super().__init__()
         self.model = diffusion_model
@@ -1302,6 +1310,18 @@ class Trainer(object):
         self.max_grad_norm = max_grad_norm
 
         self.experiment_name = experiment_name
+
+        # Optional Weights & Biases logging. Off by default so existing runs are
+        # unaffected; enable via the config (see configs/README.md).
+        self.use_wandb = use_wandb and not inference_only
+        if self.use_wandb:
+            assert wandb is not None, "use_wandb=True but wandb is not installed (pip install wandb)"
+            wandb.init(
+                project=wandb_project,
+                name=experiment_name,
+                config=wandb_config,
+                resume="allow",
+            )
 
         checkpoints_folder = f"./{self.experiment_name}/checkpoints"
         self.checkpoints_folder = Path(checkpoints_folder)
@@ -1366,7 +1386,7 @@ class Trainer(object):
 
                 print(f"{self.step}: {loss.item()}")
 
-            log = {"loss": loss.item()}
+            log = {"loss": loss.item(), "step": self.step}
 
             if exists(self.max_grad_norm):
                 self.scaler.unscale_(self.opt)
@@ -1421,8 +1441,14 @@ class Trainer(object):
                     save_folder=f"./{self.experiment_name}/sampled_videos_infos",
                 )
 
+            if self.use_wandb:
+                wandb.log(log, step=self.step)
+
             log_fn(log)
             self.step += 1
+
+        if self.use_wandb:
+            wandb.finish()
 
         print("training completed")
 

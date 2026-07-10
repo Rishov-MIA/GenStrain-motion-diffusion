@@ -36,5 +36,9 @@
         "amp": true,
         "save_and_sample_every": 500,
         "resume": true
+    },
+    "logging": {
+        "use_wandb": false,
+        "wandb_project": "genstrain-motion-diffusion"
     }
 }

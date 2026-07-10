@@ -69,6 +69,7 @@ def main():
     model_cfg = cfg["model"]
     diffusion_cfg = cfg["diffusion"]
     train_cfg = cfg["training"]
+    log_cfg = cfg.get("logging", {})
 
     save_config_snapshot(cfg, cfg["experiment_name"])
 
@@ -105,6 +106,9 @@ def main():
         ema_decay=train_cfg["ema_decay"],
         amp=train_cfg["amp"],
         experiment_name=cfg["experiment_name"],
+        use_wandb=log_cfg.get("use_wandb", False),
+        wandb_project=log_cfg.get("wandb_project", "genstrain-motion-diffusion"),
+        wandb_config=cfg,
     )
 
     if train_cfg["resume"]:

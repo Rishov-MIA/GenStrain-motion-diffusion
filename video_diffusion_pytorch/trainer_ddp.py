@@ -55,6 +55,11 @@ from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_after_o
     random_pick_condition_videos,
 )
 
+try:
+    import wandb
+except ImportError:  # wandb is optional; training works without it
+    wandb = None
+
 
 def is_dist():
     return torch.distributed.is_available() and torch.distributed.is_initialized()
@@ -176,6 +181,19 @@ class DDPTrainer(Trainer):
 
         self.experiment_name = kwargs.get("experiment_name", "test-exp")
 
+        # Optional Weights & Biases logging, on rank 0 only (off by default).
+        self.use_wandb = (
+            kwargs.get("use_wandb", False) and not inference_only and is_main_process()
+        )
+        if self.use_wandb:
+            assert wandb is not None, "use_wandb=True but wandb is not installed (pip install wandb)"
+            wandb.init(
+                project=kwargs.get("wandb_project", "genstrain-motion-diffusion"),
+                name=self.experiment_name,
+                config=kwargs.get("wandb_config"),
+                resume="allow",
+            )
+
         from pathlib import Path
 
         checkpoints_folder = f"./{self.experiment_name}/checkpoints"
@@ -277,7 +295,7 @@ class DDPTrainer(Trainer):
             if is_main_process():
                 print(f"{self.step}: {loss.item()}")
 
-            log = {"loss": loss.item()}
+            log = {"loss": loss.item(), "step": self.step}
 
             if exists(self.max_grad_norm):
                 self.scaler.unscale_(self.opt)
@@ -311,6 +329,9 @@ class DDPTrainer(Trainer):
                         save_folder=f"./{self.experiment_name}/sampled_videos_infos",
                     )
 
+            if self.use_wandb:
+                wandb.log(log, step=self.step)
+
             log_fn(log)
             self.step += 1
 
@@ -318,6 +339,9 @@ class DDPTrainer(Trainer):
             # which can take a while, doesn't desync gradient all-reduces).
             if is_dist():
                 torch.distributed.barrier()
+
+        if self.use_wandb:
+            wandb.finish()
 
         if is_main_process():
             print("training completed")

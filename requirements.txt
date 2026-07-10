@@ -16,3 +16,4 @@ imageio
 opencv-python
 scikit-image
 tomni
+wandb

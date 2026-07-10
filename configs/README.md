@@ -100,3 +100,16 @@ In DDP only rank 0 writes.
   loss, disabling DRO reweighting. Sampling is still group-balanced
   (uniform-over-groups), so this is NOT identical to base GenStrain's
   natural-distribution training. Set false for real group-DRO.
+
+### `logging` (optional)
+Weights & Biases loss monitoring. The whole block is optional — omit it and
+logging stays off (the code defaults to `use_wandb=false`). Console per-step
+loss printing is unaffected either way.
+- `use_wandb` — true = stream the per-step loss (and, for Group-DRO, the
+  `weighted_loss`, `dro_score`, `dro_q`, and a per-group `q_<group>` curve) to
+  wandb. Requires `pip install wandb` and a one-time `wandb login`. In the DDP
+  trainers only rank 0 logs. Defaults to false.
+- `wandb_project` — wandb project name the run is created under. The run is
+  named after `experiment_name`, and `resume="allow"` continues the same-named
+  run when you restart from a checkpoint. Defaults to
+  `genstrain-motion-diffusion`. The full config is uploaded as the run config.

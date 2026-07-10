@@ -26,6 +26,11 @@ from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_after_o
     random_pick_condition_videos,
 )
 
+try:
+    import wandb
+except ImportError:  # wandb is optional; training works without it
+    wandb = None
+
 
 # Disease groups we keep, in string-match PRIORITY order (first match wins).
 # A metadata "disease" string is matched by substring, so multi-label strings
@@ -225,6 +230,9 @@ class GroupDROTrainer(Trainer):
         experiment_name="test-exp",
         num_workers=4,
         inference_only=False,
+        use_wandb=False,
+        wandb_project="genstrain-motion-diffusion",
+        wandb_config=None,
     ):
         object.__init__(self)
         if gradient_accumulate_every != 1:
@@ -331,6 +339,18 @@ class GroupDROTrainer(Trainer):
         self.max_grad_norm = max_grad_norm
 
         self.experiment_name = experiment_name
+
+        # Optional Weights & Biases logging. Off by default so existing runs are
+        # unaffected; enable via the config (see configs/README.md).
+        self.use_wandb = use_wandb and not inference_only
+        if self.use_wandb:
+            assert wandb is not None, "use_wandb=True but wandb is not installed (pip install wandb)"
+            wandb.init(
+                project=wandb_project,
+                name=experiment_name,
+                config=wandb_config,
+                resume="allow",
+            )
 
         checkpoints_folder = f"./{self.experiment_name}/checkpoints"
         self.checkpoints_folder = Path(checkpoints_folder)
@@ -500,7 +520,19 @@ class GroupDROTrainer(Trainer):
                     save_folder=f"./{self.experiment_name}/sampled_videos_infos",
                 )
 
+            if self.use_wandb:
+                # Log the scalar fields plus a per-group q_<name> curve; skip the
+                # string "group" field (wandb can't plot it).
+                wandb_log = {k: v for k, v in log.items() if k != "group"}
+                wandb_log["step"] = self.step
+                for name, q in zip(self.group_names, self.dro_q.detach().cpu().tolist()):
+                    wandb_log[f"q_{name}"] = q
+                wandb.log(wandb_log, step=self.step)
+
             log_fn(log)
             self.step += 1
+
+        if self.use_wandb:
+            wandb.finish()
 
         print("training completed")

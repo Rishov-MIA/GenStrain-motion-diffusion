@@ -46,6 +46,7 @@ def main():
     diffusion_cfg = cfg["diffusion"]
     train_cfg = cfg["training"]
     dro_cfg = cfg["dro"]
+    log_cfg = cfg.get("logging", {})
 
     save_config_snapshot(cfg, cfg["experiment_name"])
 
@@ -85,6 +86,9 @@ def main():
         ema_decay=train_cfg["ema_decay"],
         amp=train_cfg["amp"],
         experiment_name=cfg["experiment_name"],
+        use_wandb=log_cfg.get("use_wandb", False),
+        wandb_project=log_cfg.get("wandb_project", "genstrain-motion-diffusion"),
+        wandb_config=cfg,
         dro_eta_q=dro_cfg["eta_q"],
         dro_adjustment_c=dro_cfg["adjustment_c"],
         dro_freeze_q=dro_cfg["freeze_q"],
