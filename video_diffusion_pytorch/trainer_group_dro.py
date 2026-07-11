@@ -38,6 +38,10 @@ except ImportError:  # wandb is optional; training works without it
 # "LBBB & Recovered DCM" -> "LBBB" (LBBB precedes DCM below), and it is also why
 # "Healthy Pediatric" MUST come before "Healthy" (otherwise every pediatric case
 # would collapse into "Healthy").
+#
+# This is only the DEFAULT: the group-DRO configs can override it via the
+# dro.allowed_disease_groups list (same priority-order semantics), which flows
+# through the trainers' allowed_disease_groups kwarg. See configs/README.md.
 ALLOWED_DISEASE_GROUPS = (
     "LBBB",
     # "Healthy Pediatric",
@@ -196,6 +200,10 @@ class GroupDROTrainer(Trainer):
         contour_condition_video_dir=None,
         sampling_contour_condition_video_dir=None,
         metadata_json_path=None,
+        # Disease groups to keep, in string-match PRIORITY order (first match
+        # wins). When None, falls back to the module-level ALLOWED_DISEASE_GROUPS.
+        # See that constant / disease_to_group for the ordering rationale.
+        allowed_disease_groups=None,
         # DRO group-weight learning rate (eta_q in the algorithm). The per-step
         # update multiplies a group's raw weight by exp(eta_q * S_g), with
         # S_g ~= L_g (a MEAN denoising loss, empirically ~0.4-1.1 here). So the
@@ -260,6 +268,12 @@ class GroupDROTrainer(Trainer):
         self.dro_freeze_q = bool(dro_freeze_q)
         self.weight_decay = float(weight_decay)
         self.num_workers = int(num_workers)
+        # None -> use the module-level default order.
+        self.allowed_disease_groups = (
+            tuple(allowed_disease_groups)
+            if allowed_disease_groups is not None
+            else ALLOWED_DISEASE_GROUPS
+        )
 
         image_size = diffusion_model.image_size
         channels = diffusion_model.channels
@@ -273,6 +287,7 @@ class GroupDROTrainer(Trainer):
                 metadata_json_path,
                 channels=channels,
                 num_frames=num_frames,
+                allowed_groups=self.allowed_disease_groups,
             )
 
             print(f"found {len(self.ds)} supported grouped videos as .npy files at {input_video_folder}")

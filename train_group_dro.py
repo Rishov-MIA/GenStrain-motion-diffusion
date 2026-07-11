@@ -104,6 +104,7 @@ def main():
         dro_eta_q=dro_cfg["eta_q"],
         dro_adjustment_c=dro_cfg["adjustment_c"],
         dro_freeze_q=dro_cfg["freeze_q"],
+        allowed_disease_groups=dro_cfg.get("allowed_disease_groups"),
         weight_decay=train_cfg["weight_decay"],
         num_workers=data_cfg["num_workers"],
     )

@@ -76,6 +76,7 @@ from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_after_o
 from video_diffusion_pytorch.trainer_group_dro import (
     GroupDROTrainer,
     GroupedContourDataset,
+    ALLOWED_DISEASE_GROUPS,
 )
 
 try:
@@ -169,6 +170,14 @@ class GroupDRODDPTrainer(GroupDROTrainer):
         self.dro_freeze_q = bool(kwargs.get("dro_freeze_q", False))
         self.weight_decay = float(kwargs.get("weight_decay", 0.0))
         self.num_workers = int(kwargs.get("num_workers", 4))
+        # Disease groups to keep, in string-match PRIORITY order (first match
+        # wins). None -> the module-level default order (ALLOWED_DISEASE_GROUPS).
+        allowed_disease_groups = kwargs.get("allowed_disease_groups")
+        self.allowed_disease_groups = (
+            tuple(allowed_disease_groups)
+            if allowed_disease_groups is not None
+            else ALLOWED_DISEASE_GROUPS
+        )
 
         image_size = diffusion_model.image_size
         channels = diffusion_model.channels
@@ -185,6 +194,7 @@ class GroupDRODDPTrainer(GroupDROTrainer):
                 metadata_json_path,
                 channels=channels,
                 num_frames=num_frames,
+                allowed_groups=self.allowed_disease_groups,
             )
 
             if is_main_process():
