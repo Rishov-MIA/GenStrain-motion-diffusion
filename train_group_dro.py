@@ -48,6 +48,14 @@ def main():
     dro_cfg = cfg["dro"]
     log_cfg = cfg.get("logging", {})
 
+    # Fill any {eta_q} / {adjustment_c} placeholders in the experiment name with
+    # the actual Group-DRO hyperparameters, so each (eta_q, adjustment_c) sweep
+    # writes to its own checkpoint folder / wandb run. Nothing on disk is mutated.
+    cfg["experiment_name"] = cfg["experiment_name"].format(
+        eta_q=dro_cfg["eta_q"],
+        adjustment_c=dro_cfg["adjustment_c"],
+    )
+
     save_config_snapshot(cfg, cfg["experiment_name"])
 
     if not torch.cuda.is_available():
@@ -72,11 +80,15 @@ def main():
 
     base_path = Path(data_cfg["base_path"])
 
+    # Sampling conditions can come from a separate dataset root via the optional
+    # sampling_base_path config field. Falls back to base_path when absent.
+    sampling_base_path = Path(data_cfg.get("sampling_base_path", str(base_path)))
+
     trainer = GroupDROTrainer(
         diffusion_model=diffusion,
         input_video_folder=str(base_path / data_cfg["input_video_subdir"]),
         contour_condition_video_dir=str(base_path / data_cfg["contour_condition_subdir"]),
-        sampling_contour_condition_video_dir=str(base_path / data_cfg["sampling_contour_condition_subdir"]),
+        sampling_contour_condition_video_dir=str(sampling_base_path / data_cfg["sampling_contour_condition_subdir"]),
         metadata_json_path=data_cfg["metadata_json_path"],
         train_batch_size=train_cfg["batch_size"],
         train_lr=train_cfg["lr"],

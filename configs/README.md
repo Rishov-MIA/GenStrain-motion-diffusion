@@ -37,7 +37,10 @@ In DDP only rank 0 writes.
 ## Fields
 
 ### top level
-- `experiment_name` — names the results/checkpoint folder.
+- `experiment_name` — names the results/checkpoint folder. Group-DRO configs may
+  include `{eta_q}` / `{adjustment_c}` placeholders, which the group-DRO scripts
+  fill with the actual `dro` hyperparameters at launch (see the `dro` section), so
+  each sweep point writes to its own folder / wandb run.
 
 ### `data`
 - `base_path` — dataset root. The `*_subdir` entries are joined onto it to

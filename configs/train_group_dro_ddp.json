@@ -1,10 +1,11 @@
 {
-    "experiment_name": "proposal-genstrain-new-26-frames-group-dro",
+    "experiment_name": "proposal-26-frames-group-dro-etaq{eta_q}-c{adjustment_c}",
     "data": {
-        "base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames",
+        "base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames_by_disease_ratio_80_20",
         "metadata_json_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/processed_excel.json",
         "input_video_subdir": "dense/train/displacement_dense",
         "contour_condition_subdir": "dense/train/dense_mask",
+        "sampling_base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames_by_disease_ratio_80_20",
         "sampling_contour_condition_subdir": "dense/test/dense_mask",
         "num_workers": 4
     },
@@ -28,8 +29,8 @@
         "contour_noise_only": false
     },
     "training": {
-        "per_gpu_batch_size": 16,
-        "lr": 1e-05,
+        "per_gpu_batch_size": 8,
+        "lr": 2e-05,
         "num_steps": 700000,
         "gradient_accumulate_every": 1,
         "ema_decay": 0.995,
@@ -39,12 +40,12 @@
         "resume": true
     },
     "dro": {
-        "eta_q": 0.02,
-        "adjustment_c": 0.0,
+        "eta_q": 0.04,
+        "adjustment_c": 1.0,
         "freeze_q": false
     },
     "logging": {
-        "use_wandb": false,
+        "use_wandb": true,
         "wandb_project": "genstrain-motion-diffusion"
     }
 }
