@@ -13,7 +13,18 @@ from torch.utils import data
 from pathlib import Path
 from torch.optim import Adam
 from torchvision import transforms as T, utils
-from torch.cuda.amp import autocast, GradScaler
+# AMP: prefer the new torch.amp API (torch >= 2.3). Fall back to the deprecated
+# torch.cuda.amp on older torch so this file stays backward compatible.
+try:
+    from torch.amp import autocast as _autocast, GradScaler as _GradScaler
+
+    def autocast(enabled=True):
+        return _autocast("cuda", enabled=enabled)
+
+    def GradScaler(enabled=True):
+        return _GradScaler("cuda", enabled=enabled)
+except ImportError:  # torch < 2.3
+    from torch.cuda.amp import autocast, GradScaler
 from PIL import Image
 
 from tqdm import tqdm
@@ -1385,7 +1396,14 @@ class Trainer(object):
             ), "need to have at least one milestone to load from latest checkpoint (milestone == -1)"
             milestone = max(all_milestones)
 
-        data = torch.load(str(self.checkpoints_folder / f"model-{milestone}.pt"))
+        # torch >= 2.6 flipped torch.load's default to weights_only=True, which
+        # rejects our checkpoint dicts; pass weights_only=False there. Older torch
+        # (< 2.0) doesn't accept that kwarg, so fall back to the plain call.
+        ckpt_path = str(self.checkpoints_folder / f"model-{milestone}.pt")
+        try:
+            data = torch.load(ckpt_path, weights_only=False)
+        except TypeError:
+            data = torch.load(ckpt_path)
 
         print(f"loaded checkpoint: model-{milestone}.pt\n")
 

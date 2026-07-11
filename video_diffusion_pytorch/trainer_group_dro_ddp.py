@@ -109,7 +109,12 @@ def setup_distributed():
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
-        torch.distributed.init_process_group(backend="nccl", device_id=device)
+        # The device_id kwarg was added in torch 2.3; on older torch (2.0-2.2)
+        # fall back to the plain call so init doesn't crash.
+        if "device_id" in inspect.signature(torch.distributed.init_process_group).parameters:
+            torch.distributed.init_process_group(backend="nccl", device_id=device)
+        else:
+            torch.distributed.init_process_group(backend="nccl")
     return local_rank, get_rank(), get_world_size(), device
 
 
