@@ -83,12 +83,16 @@ def main():
 
     base_path = Path(data_cfg["base_path"])
 
+    # Sampling conditions can come from a separate dataset root via the optional
+    # sampling_base_path config field. Falls back to base_path when absent.
+    sampling_base_path = Path(data_cfg.get("sampling_base_path", str(base_path)))
+
     trainer = DDPTrainer(
         diffusion_model=diffusion,
         input_video_folder=str(base_path / data_cfg["input_video_subdir"]),
         local_rank=local_rank,
         contour_condition_video_dir=str(base_path / data_cfg["contour_condition_subdir"]),
-        sampling_contour_condition_video_dir=str(base_path / data_cfg["sampling_contour_condition_subdir"]),
+        sampling_contour_condition_video_dir=str(sampling_base_path / data_cfg["sampling_contour_condition_subdir"]),
         train_batch_size=train_cfg["per_gpu_batch_size"],  # PER-GPU
         train_lr=train_cfg["lr"],
         save_and_sample_every=train_cfg["save_and_sample_every"],
