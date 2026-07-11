@@ -363,18 +363,20 @@ class DDPTrainer(Trainer):
                 global_loss = loss.item()
                 global_disp_recon_mse = disp_recon_mse.item()
 
-            # Per-step loss line. Route through the bar's writer so it scrolls
-            # above the pinned epoch progress bar instead of fighting it.
+            # Per-step loss line. Print/log the GLOBAL (all-rank averaged) loss so
+            # it reflects the full effective batch, not just rank 0's shard —
+            # consistent with the Group-DRO DDP trainer. Route through the bar's
+            # writer so it scrolls above the pinned epoch progress bar.
             if is_main_process():
                 epoch_bar.write(
-                    f"{self.step}: {loss.item()} | disp_recon_mse: {global_disp_recon_mse}"
+                    f"{self.step}: {global_loss} | disp_recon_mse: {global_disp_recon_mse}"
                 )
 
-            log = {"loss": loss.item(), "disp_recon_mse": global_disp_recon_mse, "step": self.step}
-            # Cumulative mean of the loss since start (rank 0 only; it's the sole
-            # consumer of `log` via wandb, and only rank 0 logs).
+            log = {"loss": global_loss, "disp_recon_mse": global_disp_recon_mse, "step": self.step}
+            # Cumulative mean of the (global) loss since start (rank 0 only; it's the
+            # sole consumer of `log` via wandb, and only rank 0 logs).
             if is_main_process():
-                self._loss_sum += loss.item()
+                self._loss_sum += global_loss
                 self._loss_count += 1
                 log["loss_cummean"] = self._loss_sum / self._loss_count
 
