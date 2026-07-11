@@ -32,32 +32,14 @@ except ImportError:  # wandb is optional; training works without it
     wandb = None
 
 
-# Disease groups we keep, in string-match PRIORITY order (first match wins).
-# A metadata "disease" string is matched by substring, so multi-label strings
-# resolve to the earliest entry found here. This is what makes e.g.
-# "LBBB & Recovered DCM" -> "LBBB" (LBBB precedes DCM below), and it is also why
-# "Healthy Pediatric" MUST come before "Healthy" (otherwise every pediatric case
-# would collapse into "Healthy").
-#
-# This is only the DEFAULT: the group-DRO configs can override it via the
-# dro.allowed_disease_groups list (same priority-order semantics), which flows
-# through the trainers' allowed_disease_groups kwarg. See configs/README.md.
-ALLOWED_DISEASE_GROUPS = (
-    "LBBB",
-    # "Healthy Pediatric",
-    # "Acute MI",
-    # "Myocarditis",
-    # "DCM",
-    "Healthy",
-)
-
-
-def disease_to_group(disease, allowed_groups=ALLOWED_DISEASE_GROUPS):
+def disease_to_group(disease, allowed_groups):
     """Map a raw metadata disease string to one of ``allowed_groups`` or None.
 
     Matching is case-insensitive substring matching in the order given by
     ``allowed_groups`` (first match wins), so ordering encodes precedence for
-    multi-label strings. See ``ALLOWED_DISEASE_GROUPS`` for the rationale.
+    multi-label strings. ``allowed_groups`` is required and comes from the
+    config's dro.allowed_disease_groups (see configs/README.md); a more specific
+    name (e.g. "Healthy Pediatric") must precede a broader one (e.g. "Healthy").
     """
     if not isinstance(disease, str):
         return None
@@ -79,9 +61,14 @@ class GroupedContourDataset(data.Dataset):
         channels=2,
         num_frames=16,
         exts=("npy",),
-        allowed_groups=ALLOWED_DISEASE_GROUPS,
+        allowed_groups=None,
     ):
         super().__init__()
+        if not allowed_groups:
+            raise ValueError(
+                "GroupedContourDataset requires a non-empty allowed_groups "
+                "(set dro.allowed_disease_groups in the config)"
+            )
         self.input_video_folder = Path(input_video_folder)
         self.contour_condition_video_dir = Path(contour_condition_video_dir)
         self.metadata_json_path = Path(metadata_json_path)
@@ -201,8 +188,8 @@ class GroupDROTrainer(Trainer):
         sampling_contour_condition_video_dir=None,
         metadata_json_path=None,
         # Disease groups to keep, in string-match PRIORITY order (first match
-        # wins). When None, falls back to the module-level ALLOWED_DISEASE_GROUPS.
-        # See that constant / disease_to_group for the ordering rationale.
+        # wins). REQUIRED for training (no hardcoded fallback) — comes from the
+        # config's dro.allowed_disease_groups. See configs/README.md / disease_to_group.
         allowed_disease_groups=None,
         # DRO group-weight learning rate (eta_q in the algorithm). The per-step
         # update multiplies a group's raw weight by exp(eta_q * S_g), with
@@ -268,11 +255,15 @@ class GroupDROTrainer(Trainer):
         self.dro_freeze_q = bool(dro_freeze_q)
         self.weight_decay = float(weight_decay)
         self.num_workers = int(num_workers)
-        # None -> use the module-level default order.
+        # Disease groups come strictly from the config (dro.allowed_disease_groups);
+        # there is no hardcoded fallback. Required whenever we build the dataset.
+        if not allowed_disease_groups and not inference_only:
+            raise ValueError(
+                "allowed_disease_groups is required (set dro.allowed_disease_groups "
+                "in the config)"
+            )
         self.allowed_disease_groups = (
-            tuple(allowed_disease_groups)
-            if allowed_disease_groups is not None
-            else ALLOWED_DISEASE_GROUPS
+            tuple(allowed_disease_groups) if allowed_disease_groups else None
         )
 
         image_size = diffusion_model.image_size
