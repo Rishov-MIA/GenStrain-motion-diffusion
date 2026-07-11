@@ -38,7 +38,7 @@
         "resume": true
     },
     "logging": {
-        "use_wandb": false,
+        "use_wandb": true,
         "wandb_project": "genstrain-motion-diffusion"
     }
 }
