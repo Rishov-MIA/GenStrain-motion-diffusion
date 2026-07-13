@@ -32,22 +32,54 @@ except ImportError:  # wandb is optional; training works without it
     wandb = None
 
 
-def disease_to_group(disease, allowed_groups):
-    """Map a raw metadata disease string to one of ``allowed_groups`` or None.
+def normalize_allowed_groups(allowed_groups):
+    """Normalize config disease-group entries to ``(name, exclude_terms)`` pairs.
 
-    Matching is case-insensitive substring matching in the order given by
-    ``allowed_groups`` (first match wins), so ordering encodes precedence for
-    multi-label strings. ``allowed_groups`` is required and comes from the
-    config's dro.allowed_disease_groups (see configs/README.md); a more specific
-    name (e.g. "Healthy Pediatric") must precede a broader one (e.g. "Healthy").
+    Each entry may be either a plain string (the group name) or a dict
+    ``{"name": ..., "exclude": [...]}``. ``exclude`` is an optional list of terms
+    that VETO the match: the group matches a disease string only if its name is a
+    substring AND none of its exclude terms are. This lets e.g. "Healthy" absorb
+    "Healthy Cardiotoxicity" while dropping "Healthy Pediatric":
+        {"name": "Healthy", "exclude": ["Pediatric"]}
+    Returns a list of (name: str, exclude_terms: tuple[str, ...]).
+    """
+    normalized = []
+    for entry in allowed_groups:
+        if isinstance(entry, str):
+            normalized.append((entry, ()))
+        elif isinstance(entry, dict):
+            name = entry["name"]
+            excludes = tuple(entry.get("exclude", ()))
+            normalized.append((name, excludes))
+        else:
+            raise TypeError(
+                f"allowed_disease_groups entries must be str or {{name, exclude}} "
+                f"dicts, got {type(entry).__name__}: {entry!r}"
+            )
+    return normalized
+
+
+def disease_to_group(disease, allowed_groups):
+    """Map a raw metadata disease string to a group name or None.
+
+    ``allowed_groups`` is the list of entries from the config's
+    dro.allowed_disease_groups (see configs/README.md), each a plain group-name
+    string or a ``{"name", "exclude"}`` dict. Matching is case-insensitive
+    substring matching in list order (first match wins), so ordering encodes
+    precedence for multi-label strings — a more specific name (e.g.
+    "Healthy Pediatric") must precede a broader one (e.g. "Healthy"). A group's
+    optional ``exclude`` terms veto the match when present in the disease string.
     """
     if not isinstance(disease, str):
         return None
 
     disease_lower = disease.lower()
-    for group_name in allowed_groups:
-        if group_name.lower() in disease_lower:
-            return group_name
+    for group_name, exclude_terms in normalize_allowed_groups(allowed_groups):
+        if group_name.lower() not in disease_lower:
+            continue
+        if any(term.lower() in disease_lower for term in exclude_terms):
+            continue  # vetoed by an exclude term (e.g. "Pediatric" for Healthy)
+        return group_name
     return None
 
 
@@ -75,7 +107,12 @@ class GroupedContourDataset(data.Dataset):
         self.image_size = image_size
         self.channels = channels
         self.num_frames = num_frames
+        # Raw entries (str or {name, exclude}) drive matching; the derived names,
+        # in list order, drive membership checks and the group ordering.
         self.allowed_groups = tuple(allowed_groups)
+        self.allowed_group_names = tuple(
+            name for name, _ in normalize_allowed_groups(allowed_groups)
+        )
 
         if not self.metadata_json_path.exists():
             raise FileNotFoundError(f"metadata JSON not found: {self.metadata_json_path}")
@@ -109,7 +146,7 @@ class GroupedContourDataset(data.Dataset):
                 continue
 
             group_name = disease_to_group(info.get("disease"), self.allowed_groups)
-            if group_name is None or group_name not in self.allowed_groups:
+            if group_name is None or group_name not in self.allowed_group_names:
                 skipped["unsupported_disease"] += 1
                 continue
 
@@ -122,7 +159,7 @@ class GroupedContourDataset(data.Dataset):
                 }
             )
 
-        self.group_names = [group for group in self.allowed_groups if any(s["group_name"] == group for s in raw_samples)]
+        self.group_names = [group for group in self.allowed_group_names if any(s["group_name"] == group for s in raw_samples)]
         self.group_to_idx = {group_name: idx for idx, group_name in enumerate(self.group_names)}
         self.samples = []
         self.group_to_indices = defaultdict(list)

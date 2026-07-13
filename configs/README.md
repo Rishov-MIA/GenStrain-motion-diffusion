@@ -111,13 +111,25 @@ In DDP only rank 0 writes.
   loss, disabling DRO reweighting. Sampling is still group-balanced
   (uniform-over-groups), so this is NOT identical to base GenStrain's
   natural-distribution training. Set false for real group-DRO.
-- `allowed_disease_groups` — optional list of disease groups to keep, in
-  string-match PRIORITY order (first match wins). A metadata disease string is
+- `allowed_disease_groups` — REQUIRED list of disease groups to keep, in
+  string-match PRIORITY order (first match wins); there is no hardcoded fallback
+  (training errors out if it is missing/empty). A metadata disease string is
   matched by case-insensitive substring, so ordering resolves multi-label
-  strings: e.g. `["LBBB", "Healthy"]` maps `"LBBB & Recovered DCM"` → `LBBB`,
-  and a more specific `"Healthy Pediatric"` must precede `"Healthy"` or it would
-  collapse into `Healthy`. Omit to use the code default
-  (`ALLOWED_DISEASE_GROUPS` in `trainer_group_dro.py`).
+  strings: `["LBBB", "Healthy"]` maps `"LBBB & Recovered DCM"` → `LBBB`, and a
+  more specific name must precede a broader one. Each entry is either a plain
+  group-name string, or a `{"name": ..., "exclude": [terms]}` object whose
+  `exclude` terms VETO the match. Example — keep `Healthy` (absorbing e.g.
+  `"Healthy Cardiotoxicity"`) but drop `"Healthy Pediatric"`:
+
+  ```json
+  "allowed_disease_groups": [
+      "LBBB",
+      { "name": "Healthy", "exclude": ["Pediatric"] }
+  ]
+  ```
+
+  A group is kept only if its name is a substring AND none of its `exclude`
+  terms are. `exclude` is case-insensitive and position-independent.
 
 ### `logging` (optional)
 Weights & Biases loss monitoring. The whole block is optional — omit it and

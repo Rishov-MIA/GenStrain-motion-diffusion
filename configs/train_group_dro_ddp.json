@@ -43,16 +43,20 @@
         "eta_q": 1e-4,
         "adjustment_c": 20,
         "freeze_q": false,
-        "_comment_allowed_disease_groups": "Order = string-match PRIORITY (first match wins). To enable a group, move it into allowed_disease_groups at the right position; a more specific name (e.g. 'Healthy Pediatric') must precede a broader one (e.g. 'Healthy').",
+        "_comment_allowed_disease_groups": "Order = string-match PRIORITY (first match wins). Entries are a group name string, or {name, exclude:[terms]} where exclude terms VETO the match. Here Healthy absorbs e.g. 'Healthy Cardiotoxicity' but drops 'Healthy Pediatric' (excluded by 'Pediatric'). A more specific name must precede a broader one.",
         "_available_disease_groups": [
-            "Healthy Pediatric",
             "Acute MI",
             "Myocarditis",
             "DCM"
         ],
         "allowed_disease_groups": [
             "LBBB",
-            "Healthy"
+            {
+                "name": "Healthy",
+                "exclude": [
+                    "Pediatric"
+                ]
+            }
         ]
     },
     "logging": {
