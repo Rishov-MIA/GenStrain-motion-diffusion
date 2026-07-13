@@ -1,5 +1,5 @@
 {
-    "experiment_name": "proposal-26-frames-group-dro-etaq{eta_q}-c{adjustment_c}",
+    "experiment_name": "proposal-26-frames-group-dro-etaq{eta_q}-c{adjustment_c}-bs{bs}",
     "data": {
         "base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames_by_disease_ratio_80_20",
         "metadata_json_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/processed_excel.json",
@@ -30,13 +30,13 @@
     },
     "training": {
         "batch_size": 16,
-        "lr": 1e-05,
+        "lr": 2e-05,
         "num_steps": 700000,
         "gradient_accumulate_every": 1,
         "ema_decay": 0.995,
         "amp": true,
         "save_and_sample_every": 300,
-        "weight_decay": 1e-05,
+        "weight_decay": 0,
         "resume": true
     },
     "dro": {

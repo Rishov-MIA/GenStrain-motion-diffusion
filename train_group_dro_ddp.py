@@ -71,12 +71,14 @@ def main():
     dro_cfg = cfg["dro"]
     log_cfg = cfg.get("logging", {})
 
-    # Fill any {eta_q} / {adjustment_c} placeholders in the experiment name with
-    # the actual Group-DRO hyperparameters, so each (eta_q, adjustment_c) sweep
-    # writes to its own checkpoint folder / wandb run. Nothing on disk is mutated.
+    # Fill any {eta_q} / {adjustment_c} / {bs} placeholders in the experiment name
+    # with the actual hyperparameters, so each (eta_q, adjustment_c, batch_size)
+    # sweep writes to its own checkpoint folder / wandb run. Nothing on disk is
+    # mutated. {bs} is the PER-GPU batch size (global batch = bs * num_gpus).
     cfg["experiment_name"] = cfg["experiment_name"].format(
         eta_q=dro_cfg["eta_q"],
         adjustment_c=dro_cfg["adjustment_c"],
+        bs=train_cfg["per_gpu_batch_size"],
     )
 
     local_rank, global_rank, world_size, device = setup_distributed()

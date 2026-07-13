@@ -1,5 +1,5 @@
 {
-    "experiment_name": "proposal-26-frames-group-dro-etaq{eta_q}-c{adjustment_c}",
+    "experiment_name": "proposal-26-frames-group-dro-etaq{eta_q}-c{adjustment_c}-bs{bs}",
     "data": {
         "base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames_by_disease_ratio_80_20",
         "metadata_json_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/processed_excel.json",
@@ -36,12 +36,12 @@
         "ema_decay": 0.995,
         "amp": true,
         "save_and_sample_every": 300,
-        "weight_decay": 1e-05,
+        "weight_decay": 0,
         "resume": true
     },
     "dro": {
-        "eta_q": 0.04,
-        "adjustment_c": 1.0,
+        "eta_q": 1e-4,
+        "adjustment_c": 20,
         "freeze_q": false,
         "_comment_allowed_disease_groups": "Order = string-match PRIORITY (first match wins). To enable a group, move it into allowed_disease_groups at the right position; a more specific name (e.g. 'Healthy Pediatric') must precede a broader one (e.g. 'Healthy').",
         "_available_disease_groups": [

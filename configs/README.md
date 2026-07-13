@@ -38,9 +38,11 @@ In DDP only rank 0 writes.
 
 ### top level
 - `experiment_name` — names the results/checkpoint folder. Group-DRO configs may
-  include `{eta_q}` / `{adjustment_c}` placeholders, which the group-DRO scripts
-  fill with the actual `dro` hyperparameters at launch (see the `dro` section), so
-  each sweep point writes to its own folder / wandb run.
+  include `{eta_q}` / `{adjustment_c}` / `{bs}` placeholders, which the group-DRO
+  scripts fill at launch — `{eta_q}` / `{adjustment_c}` from the `dro` section, and
+  `{bs}` from the training batch size (`batch_size` for the single-GPU script,
+  `per_gpu_batch_size` for the DDP script). Each sweep point thus writes to its own
+  folder / wandb run.
 
 ### `data`
 - `base_path` — dataset root. The `*_subdir` entries are joined onto it to
