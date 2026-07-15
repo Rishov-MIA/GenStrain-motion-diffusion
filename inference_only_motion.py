@@ -20,6 +20,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from video_diffusion_pytorch.config_snapshot import save_config_snapshot
 from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_only import (
@@ -29,6 +30,15 @@ from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_only im
 )
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "configs" / "inference_only_motion.json"
+
+
+def count_condition_videos(cond_video_dir, start, end):
+    """Number of files the sampling loop will process — mirrors the generator's
+    sorted-glob + [start:end] slice — so the progress bar knows its total."""
+    n = len(sorted(Path(cond_video_dir).glob("*.npy")))
+    if end is None:
+        end = n
+    return len(range(n)[start:end])
 
 
 def parse_args():
@@ -138,12 +148,13 @@ def main():
     motion_test_subdir = data_cfg["motion_test_subdir_template"].format(video_type=video_type)
     motion_cond_video_dir = str(base_path / motion_test_subdir)
     video_generator = pick_condition_videos_one_video_at_once(motion_cond_video_dir, start, end)
+    total_videos = count_condition_videos(motion_cond_video_dir, start, end)
 
     device = next(trainer.ema_model.parameters()).device
     custom_save_folder = f"./{cfg['experiment_name']}/sampling_time_sampled_{video_type}_part_videos_infos/"
     os.makedirs(custom_save_folder, exist_ok=True)
 
-    for motion_cond_video, cond_filename in video_generator:
+    for motion_cond_video, cond_filename in tqdm(video_generator, total=total_videos, desc="videos", unit="video", position=0):
         motion_cond_video = normalize_divide_by_5(motion_cond_video).to(device)
 
         # Generate samples

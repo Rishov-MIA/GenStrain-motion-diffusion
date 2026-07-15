@@ -87,6 +87,43 @@ For augmented runs, `data.base_path` should point at the **non-augmented
 sampling dataset** (the training config's `sampling_base_path`), since inference
 only samples from the test split — augmentation applies to training data only.
 
+### Faster inference: shard videos across GPUs
+
+Each video is sampled by a 1000-step DDPM chain that can't be parallelized
+internally, but the videos are independent, so the easy near-linear speedup is
+to split the test set across GPUs — one process per GPU, each handling a
+contiguous slice of the sorted condition files. `run_inference_multi_gpu.py`
+does this for you: it reads the same config, reproduces the exact folder the
+worker globs, counts the files, splits them evenly, and launches one worker per
+GPU (each pinned via `CUDA_VISIBLE_DEVICES` and handed its slice via
+`--start`/`--end`). All workers write per-video filenames into the same
+experiment folder, so results merge automatically. No model changes, no
+torchrun.
+
+```bash
+# auto-detect all GPUs, default config for the script
+python run_inference_multi_gpu.py --script inference_full_region.py
+
+# pick config + GPUs, override video_type
+python run_inference_multi_gpu.py \
+    --script inference_full_region.py \
+    --config configs/inference_group_dro.json \
+    --gpus 0,1,2,3 --video_type dense
+
+# print the per-GPU commands without launching
+python run_inference_multi_gpu.py --script inference_full_region.py --dry_run
+```
+
+Equivalent to launching the slices by hand (what the tool automates):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python inference_full_region.py --start 0  --end 33  &
+CUDA_VISIBLE_DEVICES=1 python inference_full_region.py --start 33 --end 66  &
+CUDA_VISIBLE_DEVICES=2 python inference_full_region.py --start 66 --end 99  &
+CUDA_VISIBLE_DEVICES=3 python inference_full_region.py --start 99 --end 132 &
+wait
+```
+
 ## Config tracking
 
 On startup every script saves the config it was given to
