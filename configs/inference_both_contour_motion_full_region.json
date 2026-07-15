@@ -1,0 +1,48 @@
+{
+    "experiment_name": "new-data-noise-full-region-cond-mask-motion-both",
+    "data": {
+        "base_path": "/scratch/vst2hb/Dataset_Processing/new-data-with-uk/all_data_resampled_20_frames-most-latest-with-uk",
+        "input_video_subdir": "dense/train/displacement_dense",
+        "contour_condition_subdir": "dense/train/dense_mask",
+        "motion_condition_subdir": "tlrn_dense_mask_motion/train",
+        "sampling_contour_condition_subdir": "dense/test/dense_mask",
+        "sampling_motion_condition_subdir": "tlrn_dense_mask_motion/test",
+        "contour_test_subdir_template": "{video_type}/test/{video_type}_mask",
+        "motion_test_subdir_template": "tlrn_{video_type}_mask_motion/test",
+        "gt_disp_dense_subdir": "dense/test/displacement_dense"
+    },
+    "model": {
+        "dim": 48,
+        "cond_dim": null,
+        "channels": 2,
+        "dim_mults": [
+            1,
+            2,
+            4,
+            8
+        ]
+    },
+    "diffusion": {
+        "image_size": 48,
+        "num_frames": 20,
+        "channels": 2,
+        "timesteps": 1000,
+        "loss_type": "l2",
+        "contour_noise_only": false
+    },
+    "training": {
+        "batch_size": 20,
+        "lr": 1e-05,
+        "num_steps": 700000,
+        "gradient_accumulate_every": 1,
+        "ema_decay": 0.995,
+        "amp": true,
+        "save_and_sample_every": 500
+    },
+    "inference": {
+        "milestone": -1,
+        "video_type": "dense",
+        "start": 0,
+        "end": 132
+    }
+}

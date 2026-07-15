@@ -1,14 +1,16 @@
-# Training configs
+# Configs
 
-Each JSON file here holds every hyperparameter for one training script, named
-`configs/<script_name>.json`. The scripts load their default config
-automatically; point them at another file to run a different experiment
+Each JSON file here holds every hyperparameter for one training or inference
+script, named `configs/<script_name>.json`. The scripts load their default
+config automatically; point them at another file to run a different experiment
 without touching code:
 
 ```bash
 python train_group_dro.py --config configs/my_experiment.json
 torchrun --standalone --nproc_per_node=4 train_group_dro_ddp.py --config configs/my_experiment_ddp.json
 ```
+
+## Training configs
 
 | Config | Script | Variant |
 | --- | --- | --- |
@@ -24,6 +26,66 @@ torchrun --standalone --nproc_per_node=4 train_group_dro_ddp.py --config configs
 | `train_group_dro_ddp.json` | `train_group_dro_ddp.py` | Group-DRO, contour condition, multi-GPU |
 
 Multi-GPU scripts are launched with torchrun (see each script's docstring).
+
+## Inference configs
+
+Each `inference_*.py` loads the matching config from the table below and
+generates samples from the checkpoint of the experiment named in the config.
+Fields the config shares with training (`data`, `model`, `diffusion`,
+`training`) mean the same thing, and **must match the run that produced the
+checkpoint** — the model/diffusion shape has to match the saved weights, and
+`experiment_name` selects which checkpoint folder to load from. The extra
+`inference` block holds the per-run runtime knobs; each can also be passed on
+the CLI to override the config for a single run:
+
+```bash
+python inference.py --config configs/inference.json
+python inference.py --video_type dense --start 0 --end 50   # override the config's inference block
+```
+
+| Config | Script | Variant |
+| --- | --- | --- |
+| `inference.json` | `inference.py` | contour-region noise, contour condition |
+| `inference_full_region.json` | `inference_full_region.py` | full-region noise, contour condition |
+| `inference_both_contour_motion.json` | `inference_both_contour_motion.py` | contour-region noise, contour + motion conditions |
+| `inference_both_contour_motion_full_region.json` | `inference_both_contour_motion_full_region.py` | full-region noise, contour + motion conditions |
+| `inference_only_motion.json` | `inference_only_motion.py` | motion condition only |
+
+### Augmented and Group-DRO runs
+
+Augmentation (`train_full_region_augmented*.py`) and Group-DRO
+(`train_group_dro*.py`) only change the **training loss / data pipeline**, not
+the model — both train the same `motion_after_only_contour` `Unet3D` /
+`GaussianDiffusion` that the contour-condition inference scripts already load.
+So there is **no separate inference script** for them: sample with
+`inference_full_region.py` (their checkpoints use full-region noise) pointed at
+a config that matches the run. Two ready-made ones:
+
+| Config | Script | For |
+| --- | --- | --- |
+| `inference_augmented.json` | `inference_full_region.py` | any `train_full_region_augmented*` checkpoint |
+| `inference_group_dro.json` | `inference_full_region.py` | any `train_group_dro*` checkpoint |
+
+```bash
+python inference_full_region.py --config configs/inference_group_dro.json --video_type dense
+```
+
+Two things must be set to match the run you want to sample:
+
+1. **`experiment_name` = the RESOLVED training folder name.** The training
+   configs contain `{aug}` / `{eta_q}` / `{adjustment_c}` / `{bs}` placeholders
+   that the training scripts fill at launch; the inference config needs the
+   final substituted string (e.g. `...-aug_5x`,
+   `...-group-dro-etaq0.04-c1.0-bs16`) so `trainer.load()` reads from the right
+   `./{experiment_name}` folder. The shipped defaults are examples — edit them.
+2. **The `model` / `diffusion` shape must match the checkpoint** — these
+   proposal runs use `image_size: 64`, `num_frames: 26`,
+   `contour_noise_only: false` (26-frame data), which is why they need their own
+   configs rather than the 20-frame `inference_full_region.json`.
+
+For augmented runs, `data.base_path` should point at the **non-augmented
+sampling dataset** (the training config's `sampling_base_path`), since inference
+only samples from the test split — augmentation applies to training data only.
 
 ## Config tracking
 
@@ -153,3 +215,28 @@ loss printing is unaffected either way.
   named after `experiment_name`, and `resume="allow"` continues the same-named
   run when you restart from a checkpoint. Defaults to
   `genstrain-motion-diffusion`. The full config is uploaded as the run config.
+
+### `inference` (inference configs only)
+Per-run runtime knobs for the `inference_*.py` scripts. Each field also has a
+matching CLI flag (`--video_type`, `--start`, `--end`, `--milestone`); when the
+flag is passed it wins, otherwise the config value is used. On startup each
+inference script also saves a config snapshot to
+`./{experiment_name}/config.json` (see [Config tracking](#config-tracking)).
+- `milestone` — checkpoint milestone to load; `-1` = the latest checkpoint.
+- `video_type` — which test split to sample conditions from: `cine` or `dense`.
+  `dense` also loads ground-truth displacement (from `gt_disp_dense_subdir`) so
+  it can be saved alongside the sample; `cine` has no ground truth.
+- `start`, `end` — index range into the sorted list of condition `.npy` files
+  to sample; `end: null` means "through the last file".
+
+### inference `data` subdir keys
+The inference configs reuse the training `data` keys and add a few for the
+test-split condition folders and (for `dense` runs) the ground-truth
+displacement. `*_subdir_template` values contain `{video_type}`, filled in from
+the resolved `video_type` at runtime so one config covers every split.
+- `contour_test_subdir_template` — contour-mask test folder, e.g.
+  `"{video_type}/test/{video_type}_mask"` (contour configs).
+- `motion_test_subdir_template` — motion-condition test folder, e.g.
+  `"tlrn_{video_type}_mask_motion/test"` (motion configs).
+- `gt_disp_dense_subdir` — ground-truth displacement folder used when
+  `video_type == "dense"`.
