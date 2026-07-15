@@ -24,8 +24,13 @@ def save_config_snapshot(cfg, experiment_name):
         if old_text == new_text:
             return snapshot_path
         backup_path = exp_dir / f"config_{time.strftime('%Y%m%d_%H%M%S')}.json"
-        snapshot_path.rename(backup_path)
-        print(f"config changed since last run; previous snapshot kept at {backup_path}")
+        try:
+            snapshot_path.rename(backup_path)
+            print(f"config changed since last run; previous snapshot kept at {backup_path}")
+        except FileNotFoundError:
+            # Another process already moved config.json (concurrent snapshot,
+            # e.g. sharded multi-GPU inference). Nothing to back up; just write.
+            pass
 
     snapshot_path.write_text(new_text)
     print(f"saved config snapshot to {snapshot_path}")

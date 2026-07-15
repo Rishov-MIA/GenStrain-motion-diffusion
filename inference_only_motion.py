@@ -55,6 +55,8 @@ def parse_args():
     parser.add_argument('--start', type=int, default=None, help='start index')
     parser.add_argument('--end', type=int, default=None, help='end index')
     parser.add_argument('--milestone', type=int, default=None, help='checkpoint milestone (-1 = latest)')
+    parser.add_argument('--no_config_snapshot', action='store_true',
+                        help='skip writing the config snapshot (set by the multi-GPU launcher on all but one worker to avoid a concurrent-write race)')
     return parser.parse_args()
 
 
@@ -103,7 +105,8 @@ def main():
     end = args.end if args.end is not None else infer_cfg.get("end", None)
     milestone = args.milestone if args.milestone is not None else infer_cfg.get("milestone", -1)
 
-    save_config_snapshot(cfg, cfg["experiment_name"])
+    if not args.no_config_snapshot:
+        save_config_snapshot(cfg, cfg["experiment_name"])
 
     if not torch.cuda.is_available():
         raise RuntimeError("inference_only_motion.py requires a CUDA GPU")

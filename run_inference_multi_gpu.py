@@ -176,7 +176,7 @@ def main():
     print()
 
     procs = []
-    for gpu, (lo, hi) in zip(gpus, shards):
+    for idx, (gpu, (lo, hi)) in enumerate(zip(gpus, shards)):
         cmd = [
             args.python, str(script_path),
             "--config", str(config_path),
@@ -186,6 +186,11 @@ def main():
         ]
         if args.milestone is not None:
             cmd += ["--milestone", str(args.milestone)]
+        # Every worker calls save_config_snapshot on the SAME ./{experiment}/config.json.
+        # Concurrently that races (one renames it to a backup, the rest hit
+        # FileNotFoundError). Let only the first worker write it; the rest skip.
+        if idx != 0:
+            cmd += ["--no_config_snapshot"]
         env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu)
         print(f"GPU {gpu}: videos [{lo}, {hi})  ({hi - lo})   CUDA_VISIBLE_DEVICES={gpu} {' '.join(cmd)}")
         if not args.dry_run:
