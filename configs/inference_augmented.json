@@ -5,7 +5,8 @@
         "base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames_by_disease_ratio_80_20",
         "input_video_subdir": "dense/train/displacement_dense",
         "contour_condition_subdir": "dense/train/dense_mask",
-        "sampling_contour_condition_subdir": "dense/test/dense_mask",
+        "train_sampling_contour_condition_subdir": "dense/test/dense_mask",
+        "sampling_contour_condition_subdir": "{video_type}/test/{video_type}_mask",
         "gt_disp_dense_subdir": "dense/test/displacement_dense"
     },
     "model": {

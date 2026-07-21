@@ -35,13 +35,14 @@ import sys
 from pathlib import Path
 
 # Per-script rule for the directory whose *.npy files are sharded, mirroring how
-# each inference script resolves it from the config + resolved video_type.
-#   "contour_default"  -> {base_path}/{video_type}/test/{video_type}_mask
-#   "contour_template" -> {base_path}/{data.contour_test_subdir_template}
-#   "motion_template"  -> {base_path}/{data.motion_test_subdir_template}
+# each inference script resolves it from the config + resolved video_type. These
+# must stay in sync with the scripts: if they disagree, the shard totals would be
+# computed from a different folder than the workers actually read.
+#   "contour_template" -> {base_path}/{data.sampling_contour_condition_subdir}
+#   "motion_template"  -> {base_path}/{data.sampling_motion_condition_subdir}
 COND_DIR_RULE = {
-    "inference.py": "contour_default",
-    "inference_full_region.py": "contour_default",
+    "inference.py": "contour_template",
+    "inference_full_region.py": "contour_template",
     "inference_both_contour_motion.py": "contour_template",
     "inference_both_contour_motion_full_region.py": "contour_template",
     "inference_only_motion.py": "motion_template",
@@ -94,12 +95,10 @@ def resolve_cond_dir(script_name, cfg, video_type):
     """Reproduce the exact directory the worker globs, so we count the same files."""
     base_path = Path(cfg["data"]["base_path"])
     rule = COND_DIR_RULE[script_name]
-    if rule == "contour_default":
-        return base_path / f"{video_type}/test/{video_type}_mask"
     if rule == "contour_template":
-        return base_path / cfg["data"]["contour_test_subdir_template"].format(video_type=video_type)
+        return base_path / cfg["data"]["sampling_contour_condition_subdir"].format(video_type=video_type)
     if rule == "motion_template":
-        return base_path / cfg["data"]["motion_test_subdir_template"].format(video_type=video_type)
+        return base_path / cfg["data"]["sampling_motion_condition_subdir"].format(video_type=video_type)
     raise ValueError(f"unknown cond-dir rule for {script_name}")
 
 

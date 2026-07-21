@@ -142,8 +142,8 @@ def main():
         input_video_folder=str(base_path / data_cfg["input_video_subdir"]),
         contour_condition_video_dir=str(base_path / data_cfg["contour_condition_subdir"]),
         motion_condition_video_dir=str(base_path / data_cfg["motion_condition_subdir"]),
-        sampling_contour_condition_video_dir=str(base_path / data_cfg["sampling_contour_condition_subdir"]),
-        sampling_motion_condition_video_dir=str(base_path / data_cfg["sampling_motion_condition_subdir"]),
+        sampling_contour_condition_video_dir=str(base_path / data_cfg["train_sampling_contour_condition_subdir"]),
+        sampling_motion_condition_video_dir=str(base_path / data_cfg["train_sampling_motion_condition_subdir"]),
         train_batch_size=train_cfg["batch_size"],
         train_lr=train_cfg["lr"],
         save_and_sample_every=train_cfg["save_and_sample_every"],
@@ -158,8 +158,8 @@ def main():
     # Load the requested checkpoint (milestone = -1 → latest)
     trainer.load(milestone=milestone)
 
-    contour_test_subdir = data_cfg["contour_test_subdir_template"].format(video_type=video_type)
-    motion_test_subdir = data_cfg["motion_test_subdir_template"].format(video_type=video_type)
+    contour_test_subdir = data_cfg["sampling_contour_condition_subdir"].format(video_type=video_type)
+    motion_test_subdir = data_cfg["sampling_motion_condition_subdir"].format(video_type=video_type)
     contour_cond_video_dir = str(base_path / contour_test_subdir)
     motion_cond_video_dir = str(base_path / motion_test_subdir)
     video_generator = pick_condition_videos_one_video_at_once(contour_cond_video_dir, motion_cond_video_dir, start, end)

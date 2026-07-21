@@ -4,8 +4,8 @@
         "base_path": "/scratch/vst2hb/video-diffusion-pytorch/new-data-sona-latest/all_data_resampled_20_frames-most-latest",
         "input_video_subdir": "dense/train/displacement_dense",
         "motion_condition_subdir": "tlrn_dense_mask_motion/train",
-        "sampling_motion_condition_subdir": "tlrn_dense_mask_motion/test",
-        "motion_test_subdir_template": "tlrn_{video_type}_mask_motion/test",
+        "train_sampling_motion_condition_subdir": "tlrn_dense_mask_motion/test",
+        "sampling_motion_condition_subdir": "tlrn_{video_type}_mask_motion/test",
         "gt_disp_dense_subdir": "dense/test/displacement_dense"
     },
     "model": {

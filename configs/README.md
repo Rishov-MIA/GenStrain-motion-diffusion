@@ -268,12 +268,30 @@ inference script also saves a config snapshot to
 
 ### inference `data` subdir keys
 The inference configs reuse the training `data` keys and add a few for the
-test-split condition folders and (for `dense` runs) the ground-truth
-displacement. `*_subdir_template` values contain `{video_type}`, filled in from
-the resolved `video_type` at runtime so one config covers every split.
-- `contour_test_subdir_template` — contour-mask test folder, e.g.
-  `"{video_type}/test/{video_type}_mask"` (contour configs).
-- `motion_test_subdir_template` — motion-condition test folder, e.g.
-  `"tlrn_{video_type}_mask_motion/test"` (motion configs).
+condition folders sampled at inference and (for `dense` runs) the ground-truth
+displacement.
+
+There are two similarly-named pairs; the `train_`-prefixed ones are inert at
+inference. **The un-prefixed `sampling_*` keys are the ones that decide which
+videos get inferred and how many.** They may contain `{video_type}`, filled in
+from the resolved `video_type` at runtime so one config covers every split (same
+style as training's `"aug_subdir": "aug_{aug}x"`).
+
+- `sampling_contour_condition_subdir` — contour-mask folder to sample, e.g.
+  `"{video_type}/test/{video_type}_mask"` (contour configs). **This selects the
+  inferred videos.** Change it to sample a different split, e.g.
+  `"{video_type}/test_OB/{video_type}_mask"`.
+- `sampling_motion_condition_subdir` — motion-condition folder to sample, e.g.
+  `"tlrn_{video_type}_mask_motion/test"` (motion configs). Selects the inferred
+  videos for `inference_only_motion.py`.
+- `train_sampling_contour_condition_subdir` / `train_sampling_motion_condition_subdir`
+  — passed through to the `Trainer` constructor, which only reads them inside
+  `train()` (for its periodic sample-during-training). **Unused at inference**;
+  they are kept so an inference config still fully describes the run. Training
+  always samples from a fixed `dense/test/...`, which is why these have no
+  `{video_type}`.
 - `gt_disp_dense_subdir` — ground-truth displacement folder used when
-  `video_type == "dense"`.
+  `video_type == "dense"`. If you point the sampling key at a non-`test` split,
+  move this to the matching split too (e.g. `dense/test_OB/displacement_dense`)
+  — the ground truth is loaded per sample and would otherwise silently come from
+  the wrong split.
