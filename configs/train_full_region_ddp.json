@@ -1,10 +1,10 @@
 {
-    "experiment_name": "proposal-26frames-mask-only-baseline-ddp-lbbb-healthy",
+    "experiment_name": "proposal-26frames-extended-data-all-disease",
     "data": {
-        "base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames_by_disease_ratio_80_20",
+        "base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames",
         "input_video_subdir": "dense/train/displacement_dense",
         "contour_condition_subdir": "dense/train/dense_mask",
-        "sampling_base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames_by_disease_ratio_80_20",
+        "sampling_base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames",
         "sampling_contour_condition_subdir": "dense/test/dense_mask",
         "num_workers": 4
     },

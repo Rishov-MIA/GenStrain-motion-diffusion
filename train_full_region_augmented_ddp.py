@@ -11,7 +11,7 @@ All hyperparameters live in a JSON config (default:
 configs/train_full_region_augmented_ddp.json); see configs/README.md for what
 each field means. Launch with torchrun. Example for 4 GPUs on one node:
 
-    torchrun --standalone --nproc_per_node=4 train_full_region_augmented_ddp.py --aug 5
+    torchrun --standalone --nproc_per_node=4 train_full_region_augmented_ddp.py --aug 10
 
 For 2 GPUs, with a custom config:
 
