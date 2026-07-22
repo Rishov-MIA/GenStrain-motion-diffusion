@@ -43,6 +43,9 @@ def main():
     diffusion_cfg = cfg["diffusion"]
     train_cfg = cfg["training"]
     log_cfg = cfg.get("logging", {})
+    # Optional per-sample valid-frame loss masking (see configs/README.md).
+    # Absent/empty block => masking off (original all-frames loss).
+    fv_cfg = cfg.get("frame_validity") or {}
 
     save_config_snapshot(cfg, cfg["experiment_name"])
 
@@ -80,6 +83,10 @@ def main():
         use_wandb=log_cfg.get("use_wandb", False),
         wandb_project=log_cfg.get("wandb_project", "genstrain-motion-diffusion"),
         wandb_config=cfg,
+        valid_frames_csv=fv_cfg.get("csv_path"),
+        valid_frames_filename_col=fv_cfg.get("filename_col", "dense_filename"),
+        valid_frames_count_col=fv_cfg.get("valid_frames_col", "dense_valid_frames"),
+        valid_frames_missing=fv_cfg.get("missing", "full"),
     )
 
     if train_cfg["resume"]:

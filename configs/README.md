@@ -230,6 +230,46 @@ In DDP only rank 0 writes.
   A group is kept only if its name is a substring AND none of its `exclude`
   terms are. `exclude` is case-insensitive and position-independent.
 
+### `frame_validity` (optional) — valid-frame loss masking
+Clips are resampled to `diffusion.num_frames` (e.g. 26), but a clip may only
+have the first `N` frames real and the rest padding. This block makes the
+training loss ignore the padding frames, per sample, using a CSV of valid-frame
+counts. It is **optional and off by default**: omit the block, or set
+`csv_path` to `null`, and the loss is byte-for-byte the original all-frames
+loss. Supported by every trainer (single-GPU, DDP, Group-DRO, augmented) and all
+three model variants (contour, contour+motion, motion-only).
+
+Convention: `valid_frames = N` means frames `[0:N]` are valid and
+`[N:num_frames]` are padding (leading-N). The mask is applied to the training
+`loss` **and** the `disp_recon_mse` diagnostic; the diffusion sampling process is
+unchanged.
+
+- `csv_path` — path to a CSV with one row per training video. `null`/absent =
+  masking off. The shipped configs whose dataset is
+  `all_data_resampled_26_frames` point at that dataset's `frame_counts_train.csv`
+  and are ON; the augmented / Group-DRO configs (different datasets) ship with
+  `csv_path: null` — set it to that dataset's own frame-counts CSV to enable.
+- `filename_col` — CSV column with the video filename (default `dense_filename`).
+  Matched against the training target's `.npy` filename; the `.npy` suffix is
+  optional and matching is exact otherwise.
+- `valid_frames_col` — CSV column with the leading valid-frame count (default
+  `dense_valid_frames`). Values are clamped to `[1, num_frames]`.
+- `missing` — what to do when a training file isn't in the CSV: `"full"`
+  (default) treats all frames as valid (no masking for that sample, robust to
+  gaps); `"error"` raises, if every sample must be listed.
+
+```json
+"frame_validity": {
+    "csv_path": "/…/all_data_resampled_26_frames/frame_counts_train.csv",
+    "filename_col": "dense_filename",
+    "valid_frames_col": "dense_valid_frames",
+    "missing": "full"
+}
+```
+
+On startup a trainer prints `valid-frame loss masking ON (<N> CSV entries)` when
+it is enabled (rank 0 only in DDP), so you can confirm it took effect.
+
 ### `logging` (optional)
 Weights & Biases loss monitoring. The whole block is optional — omit it and
 logging stays off (the code defaults to `use_wandb=false`). Console per-step

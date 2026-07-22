@@ -56,6 +56,7 @@ from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_after_o
     normalize_cond_img,
     random_pick_condition_videos,
 )
+from video_diffusion_pytorch.frame_validity import load_valid_frames_map
 
 try:
     import wandb
@@ -137,6 +138,15 @@ class DDPTrainer(Trainer):
         contour_condition_video_dir = kwargs.get("contour_condition_video_dir")
         train_lr = kwargs.get("train_lr", 1e-4)
 
+        # Optional per-sample valid-frame masking. Empty map (no CSV) => masking
+        # off, i.e. the loss is byte-for-byte the original all-frames loss.
+        self.valid_frames_map = load_valid_frames_map(
+            kwargs.get("valid_frames_csv"),
+            kwargs.get("valid_frames_filename_col", "dense_filename"),
+            kwargs.get("valid_frames_count_col", "dense_valid_frames"),
+        )
+        self.use_frame_validity = bool(self.valid_frames_map)
+
         if not inference_only:
             self.ds = Dataset(
                 input_video_folder,
@@ -144,7 +154,12 @@ class DDPTrainer(Trainer):
                 contour_condition_video_dir,
                 channels=channels,
                 num_frames=num_frames,
+                valid_frames_map=self.valid_frames_map,
+                valid_frames_missing=kwargs.get("valid_frames_missing", "full"),
             )
+
+            if is_main_process() and self.use_frame_validity:
+                print(f"valid-frame loss masking ON ({len(self.valid_frames_map)} CSV entries)")
 
             if is_main_process():
                 print(f"found {len(self.ds)} videos as .npy files at {input_video_folder}")
@@ -325,9 +340,10 @@ class DDPTrainer(Trainer):
                 self.sampler.set_epoch(self.step)
 
             for i in range(self.gradient_accumulate_every):
-                input_video, contour_cond_video = next(self.dl)
+                input_video, contour_cond_video, valid_frames = next(self.dl)
                 input_video = input_video.to(self.device, non_blocking=True)
                 contour_cond_video = contour_cond_video.to(self.device, non_blocking=True)
+                valid_frames = valid_frames.to(self.device, non_blocking=True) if self.use_frame_validity else None
 
                 # Only sync gradients on the last accumulation micro-step.
                 is_last_micro = i == (self.gradient_accumulate_every - 1)
@@ -342,6 +358,7 @@ class DDPTrainer(Trainer):
                         loss, _, _, disp_recon_mse = self.ddp_model(
                             input_video,
                             cond=[contour_cond_video],
+                            valid_frames=valid_frames,
                             prob_focus_present=prob_focus_present,
                             focus_present_mask=focus_present_mask,
                         )

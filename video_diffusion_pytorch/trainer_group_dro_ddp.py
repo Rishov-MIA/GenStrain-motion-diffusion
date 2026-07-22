@@ -77,6 +77,7 @@ from video_diffusion_pytorch.trainer_group_dro import (
     GroupDROTrainer,
     GroupedContourDataset,
 )
+from video_diffusion_pytorch.frame_validity import load_valid_frames_map
 
 try:
     import wandb
@@ -189,6 +190,15 @@ class GroupDRODDPTrainer(GroupDROTrainer):
         contour_condition_video_dir = kwargs.get("contour_condition_video_dir")
         train_lr = kwargs.get("train_lr", 1e-4)
 
+        # Optional per-sample valid-frame masking. Empty map (no CSV) => masking
+        # off, i.e. the loss is byte-for-byte the original all-frames loss.
+        self.valid_frames_map = load_valid_frames_map(
+            kwargs.get("valid_frames_csv"),
+            kwargs.get("valid_frames_filename_col", "dense_filename"),
+            kwargs.get("valid_frames_count_col", "dense_valid_frames"),
+        )
+        self.use_frame_validity = bool(self.valid_frames_map)
+
         if not inference_only:
             self.ds = GroupedContourDataset(
                 input_video_folder,
@@ -198,7 +208,12 @@ class GroupDRODDPTrainer(GroupDROTrainer):
                 channels=channels,
                 num_frames=num_frames,
                 allowed_groups=self.allowed_disease_groups,
+                valid_frames_map=self.valid_frames_map,
+                valid_frames_missing=kwargs.get("valid_frames_missing", "full"),
             )
+
+            if is_main_process() and self.use_frame_validity:
+                print(f"valid-frame loss masking ON ({len(self.valid_frames_map)} CSV entries)")
 
             if is_main_process():
                 print(f"found {len(self.ds)} supported grouped videos as .npy files at {input_video_folder}")
@@ -404,14 +419,16 @@ class GroupDRODDPTrainer(GroupDROTrainer):
 
             # Each rank pulls its own B-sized batch of THIS group (different samples
             # per rank via per-rank seeding), for a global batch of B * world_size.
-            input_video, contour_cond_video, _, _ = next(self.group_loaders[group_idx])
+            input_video, contour_cond_video, _, _, valid_frames = next(self.group_loaders[group_idx])
             input_video = input_video.to(self.device, non_blocking=True)
             contour_cond_video = contour_cond_video.to(self.device, non_blocking=True)
+            valid_frames = valid_frames.to(self.device, non_blocking=True) if self.use_frame_validity else None
 
             with autocast(enabled=self.amp):
                 loss, x0, x_start, disp_recon_mse = self.ddp_model(
                     input_video,
                     cond=[contour_cond_video],
+                    valid_frames=valid_frames,
                     prob_focus_present=prob_focus_present,
                     focus_present_mask=focus_present_mask,
                 )

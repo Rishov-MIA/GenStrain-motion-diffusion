@@ -41,5 +41,12 @@
     "logging": {
         "use_wandb": true,
         "wandb_project": "genstrain-motion-diffusion"
+    },
+    "frame_validity": {
+        "_comment": "set csv_path to this dataset's frame-counts CSV to mask padding frames in the loss; null = off (all frames)",
+        "csv_path": null,
+        "filename_col": "dense_filename",
+        "valid_frames_col": "dense_valid_frames",
+        "missing": "error"
     }
 }

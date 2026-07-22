@@ -25,6 +25,7 @@ from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_after_o
     normalize_cond_img,
     random_pick_condition_videos,
 )
+from video_diffusion_pytorch.frame_validity import load_valid_frames_map, resolve_valid_frames
 
 try:
     import wandb
@@ -94,6 +95,8 @@ class GroupedContourDataset(data.Dataset):
         num_frames=16,
         exts=("npy",),
         allowed_groups=None,
+        valid_frames_map=None,       # {filename: valid_frame_count}; empty => all frames valid
+        valid_frames_missing="full",  # behavior when a file is absent from the map
     ):
         super().__init__()
         if not allowed_groups:
@@ -107,6 +110,8 @@ class GroupedContourDataset(data.Dataset):
         self.image_size = image_size
         self.channels = channels
         self.num_frames = num_frames
+        self.valid_frames_map = valid_frames_map or {}
+        self.valid_frames_missing = valid_frames_missing
         # Raw entries (str or {name, exclude}) drive matching; the derived names,
         # in list order, drive membership checks and the group ordering.
         self.allowed_groups = tuple(allowed_groups)
@@ -203,11 +208,16 @@ class GroupedContourDataset(data.Dataset):
         input_video_tensor = torch.from_numpy(np.load(sample["input_path"])).float()
         contour_condition_video_tensor = torch.from_numpy(np.load(sample["contour_path"])).float()
 
+        valid_frames = resolve_valid_frames(
+            self.valid_frames_map, sample["filename"], self.num_frames, self.valid_frames_missing
+        )
+
         return (
             input_video_tensor.squeeze(0),
             contour_condition_video_tensor,
             sample["group_idx"],
             sample["filename"],
+            valid_frames,
         )
 
     def indices_for_group(self, group_idx):
@@ -265,6 +275,10 @@ class GroupDROTrainer(Trainer):
         use_wandb=False,
         wandb_project="genstrain-motion-diffusion",
         wandb_config=None,
+        valid_frames_csv=None,
+        valid_frames_filename_col="dense_filename",
+        valid_frames_count_col="dense_valid_frames",
+        valid_frames_missing="full",
     ):
         object.__init__(self)
         if gradient_accumulate_every != 1:
@@ -307,6 +321,13 @@ class GroupDROTrainer(Trainer):
         channels = diffusion_model.channels
         num_frames = diffusion_model.num_frames
 
+        # Optional per-sample valid-frame masking. Empty map (no CSV) => masking
+        # off, i.e. the loss is byte-for-byte the original all-frames loss.
+        self.valid_frames_map = load_valid_frames_map(
+            valid_frames_csv, valid_frames_filename_col, valid_frames_count_col
+        )
+        self.use_frame_validity = bool(self.valid_frames_map)
+
         if not inference_only:
             self.ds = GroupedContourDataset(
                 input_video_folder,
@@ -316,7 +337,12 @@ class GroupDROTrainer(Trainer):
                 channels=channels,
                 num_frames=num_frames,
                 allowed_groups=self.allowed_disease_groups,
+                valid_frames_map=self.valid_frames_map,
+                valid_frames_missing=valid_frames_missing,
             )
+
+            if self.use_frame_validity:
+                print(f"valid-frame loss masking ON ({len(self.valid_frames_map)} CSV entries)")
 
             print(f"found {len(self.ds)} supported grouped videos as .npy files at {input_video_folder}")
             print(f"group counts: {dict(zip(self.ds.group_names, self.ds.group_counts))}")
@@ -492,14 +518,16 @@ class GroupDROTrainer(Trainer):
             group_name = self.group_names[group_idx]
 
             # Pull one B-sized batch from the chosen group's cycled loader.
-            input_video, contour_cond_video, _, _ = next(self.group_loaders[group_idx])
+            input_video, contour_cond_video, _, _, valid_frames = next(self.group_loaders[group_idx])
             input_video = input_video.to(self.device, non_blocking=True)
             contour_cond_video = contour_cond_video.to(self.device, non_blocking=True)
+            valid_frames = valid_frames.to(self.device, non_blocking=True) if self.use_frame_validity else None
 
             with autocast(enabled=self.amp):
                 loss, x0, x_start, disp_recon_mse = self.model(
                     input_video,
                     cond=[contour_cond_video],
+                    valid_frames=valid_frames,
                     prob_focus_present=prob_focus_present,
                     focus_present_mask=focus_present_mask,
                 )

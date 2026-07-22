@@ -47,6 +47,9 @@ def main():
     train_cfg = cfg["training"]
     dro_cfg = cfg["dro"]
     log_cfg = cfg.get("logging", {})
+    # Optional per-sample valid-frame loss masking (see configs/README.md).
+    # Absent/empty block => masking off (original all-frames loss).
+    fv_cfg = cfg.get("frame_validity") or {}
 
     # Fill any {eta_q} / {adjustment_c} / {bs} placeholders in the experiment name
     # with the actual hyperparameters, so each (eta_q, adjustment_c, batch_size)
@@ -103,6 +106,10 @@ def main():
         use_wandb=log_cfg.get("use_wandb", False),
         wandb_project=log_cfg.get("wandb_project", "genstrain-motion-diffusion"),
         wandb_config=cfg,
+        valid_frames_csv=fv_cfg.get("csv_path"),
+        valid_frames_filename_col=fv_cfg.get("filename_col", "dense_filename"),
+        valid_frames_count_col=fv_cfg.get("valid_frames_col", "dense_valid_frames"),
+        valid_frames_missing=fv_cfg.get("missing", "full"),
         dro_eta_q=dro_cfg["eta_q"],
         dro_adjustment_c=dro_cfg["adjustment_c"],
         dro_freeze_q=dro_cfg["freeze_q"],

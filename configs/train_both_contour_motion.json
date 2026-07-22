@@ -40,5 +40,11 @@
     "logging": {
         "use_wandb": false,
         "wandb_project": "genstrain-motion-diffusion"
+    },
+    "frame_validity": {
+        "csv_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames/frame_counts_train.csv",
+        "filename_col": "dense_filename",
+        "valid_frames_col": "dense_valid_frames",
+        "missing": "error"
     }
 }

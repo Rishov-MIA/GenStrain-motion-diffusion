@@ -45,6 +45,11 @@ from video_diffusion_pytorch.utils import (
     generate_displacement_quiver_gif_predicted_reconstructed_gt,
     generate_displacement_quiver_gif_comparison
 )
+from video_diffusion_pytorch.frame_validity import (
+    build_frame_mask,
+    load_valid_frames_map,
+    resolve_valid_frames,
+)
 
 # helpers functions
 
@@ -914,10 +919,16 @@ class GaussianDiffusion(nn.Module):
             + extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, cond=None, noise=None, **kwargs):
+    def p_losses(self, x_start, t, cond=None, noise=None, valid_frames=None, **kwargs):
         # cond: [contour_cond_video]
         b, c, f, h, w, device = *x_start.shape, x_start.device
         noise = default(noise, lambda: torch.randn_like(x_start))
+
+        # Optional per-sample valid-frame mask [B, 1, F, 1, 1]: 1 on the leading
+        # valid frames, 0 on padding. None (no CSV) => original, unmasked loss.
+        frame_mask = None
+        if valid_frames is not None:
+            frame_mask = build_frame_mask(valid_frames, f, device=device, dtype=x_start.dtype)
 
         # When contour_noise_only is enabled, mask noise using first frame of condition mask
         noise_mask = None
@@ -951,30 +962,57 @@ class GaussianDiffusion(nn.Module):
         # and the model's predicted x0, in normalized space. This measures the
         # actual displacement-prediction quality, distinct from `loss` (the
         # noise-prediction objective the model is trained on).
-        disp_recon_mse = torch.mean((x_start - x0) ** 2)
+        if frame_mask is None:
+            disp_recon_mse = torch.mean((x_start - x0) ** 2)
+        else:
+            disp_recon_mse = ((x_start - x0) ** 2 * frame_mask).sum() / frame_mask.expand_as(x_start).sum().clamp(min=1.0)
 
         if self.contour_noise_only and noise_mask is not None:
             # Compute loss only in the contour region
-            masked_noise = noise * noise_mask
-            masked_recon = x_recon * noise_mask
-            num_contour_pixels = noise_mask.sum().clamp(min=1.0)
-            if self.loss_type == "l1":
-                loss = (masked_noise - masked_recon).abs().sum() / num_contour_pixels
-            elif self.loss_type == "l2":
-                loss = ((masked_noise - masked_recon) ** 2).sum() / num_contour_pixels
+            if frame_mask is None:
+                masked_noise = noise * noise_mask
+                masked_recon = x_recon * noise_mask
+                num_contour_pixels = noise_mask.sum().clamp(min=1.0)
+                if self.loss_type == "l1":
+                    loss = (masked_noise - masked_recon).abs().sum() / num_contour_pixels
+                elif self.loss_type == "l2":
+                    loss = ((masked_noise - masked_recon) ** 2).sum() / num_contour_pixels
+                else:
+                    raise NotImplementedError()
             else:
-                raise NotImplementedError()
+                # ...and, when given, only inside the valid frames
+                region = noise_mask * frame_mask
+                num_contour_pixels = region.sum().clamp(min=1.0)
+                diff = noise - x_recon
+                if self.loss_type == "l1":
+                    loss = (diff.abs() * region).sum() / num_contour_pixels
+                elif self.loss_type == "l2":
+                    loss = ((diff ** 2) * region).sum() / num_contour_pixels
+                else:
+                    raise NotImplementedError()
         else:
-            if self.loss_type == "l1":
-                loss = F.l1_loss(noise, x_recon)
-            elif self.loss_type == "l2":
-                loss = F.mse_loss(noise, x_recon)
+            if frame_mask is None:
+                if self.loss_type == "l1":
+                    loss = F.l1_loss(noise, x_recon)
+                elif self.loss_type == "l2":
+                    loss = F.mse_loss(noise, x_recon)
+                else:
+                    raise NotImplementedError()
             else:
-                raise NotImplementedError()
+                # Full-region loss, averaged over valid frames only
+                diff = noise - x_recon
+                if self.loss_type == "l1":
+                    per_element = diff.abs()
+                elif self.loss_type == "l2":
+                    per_element = diff ** 2
+                else:
+                    raise NotImplementedError()
+                denom = frame_mask.expand_as(per_element).sum().clamp(min=1.0)
+                loss = (per_element * frame_mask).sum() / denom
 
         return loss, unnormalize_divide_by_5(x0), unnormalize_divide_by_5(x_start), disp_recon_mse
         
-    def forward(self, x, cond=None, *args, **kwargs):
+    def forward(self, x, cond=None, *args, valid_frames=None, **kwargs):
         # cond type: [contour_cond_video]
         (
             b,
@@ -987,10 +1025,10 @@ class GaussianDiffusion(nn.Module):
         )
         check_shape(x, "b c f h w", c=self.channels, f=self.num_frames, h=img_size, w=img_size)
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
-        
+
         x = normalize_divide_by_5(x)
         contour_cond_video = normalize_cond_img(cond[0])
-        return self.p_losses(x, t, cond=[contour_cond_video], **kwargs)
+        return self.p_losses(x, t, cond=[contour_cond_video], valid_frames=valid_frames, **kwargs)
     
     
     @torch.inference_mode()
@@ -1116,12 +1154,17 @@ class Dataset(data.Dataset):
         horizontal_flip=False,
         force_num_frames=True,
         exts=["npy"],  # both video as .npy format
+        valid_frames_map=None,       # {filename: valid_frame_count}; empty => all frames valid
+        valid_frames_missing="full",  # behavior when a file is absent from the map
     ):
         super().__init__()
         self.input_video_folder = input_video_folder
         self.contour_condition_video_dir = contour_condition_video_dir
         self.image_size = image_size
         self.channels = channels
+        self.num_frames = num_frames
+        self.valid_frames_map = valid_frames_map or {}
+        self.valid_frames_missing = valid_frames_missing
 
         self.video_pairs = []
 
@@ -1164,11 +1207,18 @@ class Dataset(data.Dataset):
             # Retrieve from cache
             input_video_tensor, contour_condition_video_tensor = self.cache[index]
 
+        # Per-sample valid-frame count (leading-N valid); num_frames when the
+        # file isn't in the map or no CSV was given => an all-valid mask downstream.
+        valid_frames = resolve_valid_frames(
+            self.valid_frames_map, Path(input_video_path).name, self.num_frames, self.valid_frames_missing
+        )
+
         # Optionally, you can apply any transformations here (like resizing, normalization, etc.)
         # For now, return the tensors directly
         return (
             input_video_tensor.squeeze(0),  # Remove extra dimension
             contour_condition_video_tensor,
+            valid_frames,
         )
 
 def random_pick_condition_videos(num_samples, contour_cond_video_dir):
@@ -1220,6 +1270,10 @@ class Trainer(object):
         use_wandb=False,
         wandb_project="genstrain-motion-diffusion",
         wandb_config=None,
+        valid_frames_csv=None,
+        valid_frames_filename_col="dense_filename",
+        valid_frames_count_col="dense_valid_frames",
+        valid_frames_missing="full",
     ):
         super().__init__()
         self.model = diffusion_model
@@ -1240,6 +1294,13 @@ class Trainer(object):
         channels = diffusion_model.channels
         num_frames = diffusion_model.num_frames
 
+        # Optional per-sample valid-frame masking. Empty map (no CSV) => masking
+        # off, i.e. the loss is byte-for-byte the original all-frames loss.
+        self.valid_frames_map = load_valid_frames_map(
+            valid_frames_csv, valid_frames_filename_col, valid_frames_count_col
+        )
+        self.use_frame_validity = bool(self.valid_frames_map)
+
         if not inference_only:
             self.ds = Dataset(
                 input_video_folder,
@@ -1247,7 +1308,12 @@ class Trainer(object):
                 contour_condition_video_dir,
                 channels=channels,
                 num_frames=num_frames,
+                valid_frames_map=self.valid_frames_map,
+                valid_frames_missing=valid_frames_missing,
             )
+
+            if self.use_frame_validity:
+                print(f"valid-frame loss masking ON ({len(self.valid_frames_map)} CSV entries)")
 
             print(f"found {len(self.ds)} videos as .npy files at {input_video_folder}")
             assert len(self.ds) > 0, "need to have at least 1 video to start training (although 1 is not great, try 100k)"
@@ -1374,14 +1440,16 @@ class Trainer(object):
 
         while self.step < self.train_num_steps:
             for i in range(self.gradient_accumulate_every):
-                input_video, contour_cond_video = next(self.dl)
+                input_video, contour_cond_video, valid_frames = next(self.dl)
                 input_video = input_video.cuda()
                 contour_cond_video = contour_cond_video.cuda()
+                valid_frames = valid_frames.cuda() if self.use_frame_validity else None
 
                 with autocast(enabled=self.amp):
                     loss, x0, x_start, disp_recon_mse = self.model(
                         input_video,
                         cond=[contour_cond_video],
+                        valid_frames=valid_frames,
                         prob_focus_present=prob_focus_present,
                         focus_present_mask=focus_present_mask,
                     )

@@ -40,7 +40,7 @@
         "resume": true
     },
     "dro": {
-        "eta_q": 1e-4,
+        "eta_q": 0.0001,
         "adjustment_c": 20,
         "freeze_q": false,
         "_comment_allowed_disease_groups": "Order = string-match PRIORITY (first match wins). Entries are a group name string, or {name, exclude:[terms]} where exclude terms VETO the match. Here Healthy absorbs e.g. 'Healthy Cardiotoxicity' but drops 'Healthy Pediatric' (excluded by 'Pediatric'). A more specific name must precede a broader one.",
@@ -62,5 +62,12 @@
     "logging": {
         "use_wandb": true,
         "wandb_project": "genstrain-motion-diffusion"
+    },
+    "frame_validity": {
+        "_comment": "set csv_path to this dataset's frame-counts CSV to mask padding frames in the loss; null = off (all frames)",
+        "csv_path": null,
+        "filename_col": "dense_filename",
+        "valid_frames_col": "dense_valid_frames",
+        "missing": "error"
     }
 }
