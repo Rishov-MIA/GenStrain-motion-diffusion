@@ -181,10 +181,16 @@ class GroupedContourDataset(data.Dataset):
     @staticmethod
     def _lookup_metadata(metadata, filename):
         path = Path(filename)
-        stems = [path.stem]
-        cycle_base_stem = re.sub(r"_cycle[A-Za-z0-9]+$", "", path.stem)
-        if cycle_base_stem != path.stem:
-            stems.append(cycle_base_stem)
+        # Candidate stems, most specific first. Augmented copies are named
+        # "<original>_scale_<f>" (e.g. "10AF05640_mid_20160818_NS_scale_0p77",
+        # where 0p77 == a 0.77 scale) and share the source sample's disease, so
+        # strip a trailing "_scale_<f>" to fall back to the original file's
+        # metadata key. Likewise strip a trailing "_cycleN" as before.
+        stems = []
+        for stem in (path.stem, re.sub(r"_scale_\d+(?:p\d+)?$", "", path.stem)):
+            for candidate in (stem, re.sub(r"_cycle[A-Za-z0-9]+$", "", stem)):
+                if candidate not in stems:
+                    stems.append(candidate)
 
         keys = [filename]
         for stem in stems:
