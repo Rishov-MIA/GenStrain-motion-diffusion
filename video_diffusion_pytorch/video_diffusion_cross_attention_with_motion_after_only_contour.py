@@ -919,10 +919,18 @@ class GaussianDiffusion(nn.Module):
             + extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, cond=None, noise=None, valid_frames=None, **kwargs):
+    def p_losses(self, x_start, t, cond=None, noise=None, valid_frames=None, per_sample=False, **kwargs):
         # cond: [contour_cond_video]
         b, c, f, h, w, device = *x_start.shape, x_start.device
         noise = default(noise, lambda: torch.randn_like(x_start))
+
+        # per_sample=False (the default) keeps the original batch-joint reduction
+        # byte-for-byte: every sum collapses the whole [B, C, F, H, W] tensor to a
+        # scalar. per_sample=True instead keeps the batch dim, returning [B] losses
+        # so a caller can weight each sample individually (see the inverse-frequency
+        # reweighting trainer). Both numerator and denominator go through `reduce`,
+        # so each branch's normalization — and its scale — is unchanged per sample.
+        reduce = (lambda z: z.flatten(1).sum(1)) if per_sample else (lambda z: z.sum())
 
         # Optional per-sample valid-frame mask [B, 1, F, 1, 1]: 1 on the leading
         # valid frames, 0 on padding. None (no CSV) => original, unmasked loss.
@@ -963,41 +971,55 @@ class GaussianDiffusion(nn.Module):
         # actual displacement-prediction quality, distinct from `loss` (the
         # noise-prediction objective the model is trained on).
         if frame_mask is None:
-            disp_recon_mse = torch.mean((x_start - x0) ** 2)
+            if per_sample:
+                disp_recon_mse = ((x_start - x0) ** 2).flatten(1).mean(1)
+            else:
+                disp_recon_mse = torch.mean((x_start - x0) ** 2)
         else:
-            disp_recon_mse = ((x_start - x0) ** 2 * frame_mask).sum() / frame_mask.expand_as(x_start).sum().clamp(min=1.0)
+            disp_recon_mse = reduce((x_start - x0) ** 2 * frame_mask) / reduce(
+                frame_mask.expand_as(x_start)
+            ).clamp(min=1.0)
 
         if self.contour_noise_only and noise_mask is not None:
             # Compute loss only in the contour region
             if frame_mask is None:
                 masked_noise = noise * noise_mask
                 masked_recon = x_recon * noise_mask
-                num_contour_pixels = noise_mask.sum().clamp(min=1.0)
+                # NOTE: noise_mask is [B, 1, F, H, W] while the numerator is
+                # [B, C, F, H, W], so this loss is C x the true per-element mean.
+                # Preserved deliberately — "fixing" it would rescale the effective
+                # learning rate of every existing contour_noise_only run.
+                num_contour_pixels = reduce(noise_mask).clamp(min=1.0)
                 if self.loss_type == "l1":
-                    loss = (masked_noise - masked_recon).abs().sum() / num_contour_pixels
+                    loss = reduce((masked_noise - masked_recon).abs()) / num_contour_pixels
                 elif self.loss_type == "l2":
-                    loss = ((masked_noise - masked_recon) ** 2).sum() / num_contour_pixels
+                    loss = reduce((masked_noise - masked_recon) ** 2) / num_contour_pixels
                 else:
                     raise NotImplementedError()
             else:
                 # ...and, when given, only inside the valid frames
                 region = noise_mask * frame_mask
-                num_contour_pixels = region.sum().clamp(min=1.0)
+                num_contour_pixels = reduce(region).clamp(min=1.0)
                 diff = noise - x_recon
                 if self.loss_type == "l1":
-                    loss = (diff.abs() * region).sum() / num_contour_pixels
+                    loss = reduce(diff.abs() * region) / num_contour_pixels
                 elif self.loss_type == "l2":
-                    loss = ((diff ** 2) * region).sum() / num_contour_pixels
+                    loss = reduce((diff ** 2) * region) / num_contour_pixels
                 else:
                     raise NotImplementedError()
         else:
             if frame_mask is None:
+                # Every sample has the same element count here, so the per-sample
+                # mean averaged over the batch equals the batch-joint mean exactly.
+                loss_reduction = "none" if per_sample else "mean"
                 if self.loss_type == "l1":
-                    loss = F.l1_loss(noise, x_recon)
+                    loss = F.l1_loss(noise, x_recon, reduction=loss_reduction)
                 elif self.loss_type == "l2":
-                    loss = F.mse_loss(noise, x_recon)
+                    loss = F.mse_loss(noise, x_recon, reduction=loss_reduction)
                 else:
                     raise NotImplementedError()
+                if per_sample:
+                    loss = loss.flatten(1).mean(1)
             else:
                 # Full-region loss, averaged over valid frames only
                 diff = noise - x_recon
@@ -1007,13 +1029,16 @@ class GaussianDiffusion(nn.Module):
                     per_element = diff ** 2
                 else:
                     raise NotImplementedError()
-                denom = frame_mask.expand_as(per_element).sum().clamp(min=1.0)
-                loss = (per_element * frame_mask).sum() / denom
+                denom = reduce(frame_mask.expand_as(per_element)).clamp(min=1.0)
+                loss = reduce(per_element * frame_mask) / denom
 
         return loss, unnormalize_divide_by_5(x0), unnormalize_divide_by_5(x_start), disp_recon_mse
         
-    def forward(self, x, cond=None, *args, valid_frames=None, **kwargs):
+    def forward(self, x, cond=None, *args, valid_frames=None, per_sample=False, **kwargs):
         # cond type: [contour_cond_video]
+        # per_sample must be a NAMED parameter here, not left to **kwargs: kwargs is
+        # forwarded into self.denoise_fn (the UNet) inside p_losses, which would
+        # reject it.
         (
             b,
             device,
@@ -1028,7 +1053,9 @@ class GaussianDiffusion(nn.Module):
 
         x = normalize_divide_by_5(x)
         contour_cond_video = normalize_cond_img(cond[0])
-        return self.p_losses(x, t, cond=[contour_cond_video], valid_frames=valid_frames, **kwargs)
+        return self.p_losses(
+            x, t, cond=[contour_cond_video], valid_frames=valid_frames, per_sample=per_sample, **kwargs
+        )
     
     
     @torch.inference_mode()

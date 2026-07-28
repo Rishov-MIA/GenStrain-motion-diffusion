@@ -24,6 +24,8 @@ torchrun --standalone --nproc_per_node=4 train_group_dro_ddp.py --config configs
 | `train_only_motion.json` | `train_only_motion.py` | motion condition only |
 | `train_group_dro.json` | `train_group_dro.py` | Group-DRO, contour condition |
 | `train_group_dro_ddp.json` | `train_group_dro_ddp.py` | Group-DRO, contour condition, multi-GPU |
+| `train_inverse_freq.json` | `train_inverse_freq.py` | inverse-frequency reweighting, contour condition |
+| `train_inverse_freq_ddp.json` | `train_inverse_freq_ddp.py` | inverse-frequency reweighting, contour condition, multi-GPU |
 
 Multi-GPU scripts are launched with torchrun (see each script's docstring).
 
@@ -51,20 +53,22 @@ python inference.py --video_type dense --start 0 --end 50   # override the confi
 | `inference_both_contour_motion_full_region.json` | `inference_both_contour_motion_full_region.py` | full-region noise, contour + motion conditions |
 | `inference_only_motion.json` | `inference_only_motion.py` | motion condition only |
 
-### Augmented and Group-DRO runs
+### Augmented, Group-DRO and inverse-frequency runs
 
-Augmentation (`train_full_region_augmented*.py`) and Group-DRO
-(`train_group_dro*.py`) only change the **training loss / data pipeline**, not
-the model — both train the same `motion_after_only_contour` `Unet3D` /
+Augmentation (`train_full_region_augmented*.py`), Group-DRO
+(`train_group_dro*.py`) and inverse-frequency reweighting
+(`train_inverse_freq*.py`) only change the **training loss / data pipeline**, not
+the model — all train the same `motion_after_only_contour` `Unet3D` /
 `GaussianDiffusion` that the contour-condition inference scripts already load.
 So there is **no separate inference script** for them: sample with
 `inference_full_region.py` (their checkpoints use full-region noise) pointed at
-a config that matches the run. Two ready-made ones:
+a config that matches the run. Three ready-made ones:
 
 | Config | Script | For |
 | --- | --- | --- |
 | `inference_augmented.json` | `inference_full_region.py` | any `train_full_region_augmented*` checkpoint |
 | `inference_group_dro.json` | `inference_full_region.py` | any `train_group_dro*` checkpoint |
+| `inference_inverse_freq.json` | `inference_full_region.py` | any `train_inverse_freq*` checkpoint |
 
 ```bash
 python inference_full_region.py --config configs/inference_group_dro.json --video_type dense
@@ -76,7 +80,8 @@ Two things must be set to match the run you want to sample:
    configs contain `{aug}` / `{eta_q}` / `{adjustment_c}` / `{bs}` placeholders
    that the training scripts fill at launch; the inference config needs the
    final substituted string (e.g. `...-aug_5x`,
-   `...-group-dro-etaq0.04-c1.0-bs16`) so `trainer.load()` reads from the right
+   `...-group-dro-etaq0.04-c1.0-bs16`, `...-inverse-freq-bs16`) so
+   `trainer.load()` reads from the right
    `./{experiment_name}` folder. The shipped defaults are examples — edit them.
 2. **The `model` / `diffusion` shape must match the checkpoint** — these
    proposal runs use `image_size: 64`, `num_frames: 26`,
@@ -141,7 +146,8 @@ In DDP only rank 0 writes.
   scripts fill at launch — `{eta_q}` / `{adjustment_c}` from the `dro` section, and
   `{bs}` from the training batch size (`batch_size` for the single-GPU script,
   `per_gpu_batch_size` for the DDP script). Each sweep point thus writes to its own
-  folder / wandb run.
+  folder / wandb run. The inverse-frequency configs support `{bs}` only — the
+  reweighting has no hyperparameters to sweep.
 
 ### `data`
 - `base_path` — dataset root. The `*_subdir` entries are joined onto it to
@@ -163,10 +169,10 @@ In DDP only rank 0 writes.
   when sampling should draw from a separate (e.g. non-augmented) dataset — the
   `sampling_*_subdir` entries are joined onto this path. When absent, sampling
   falls back to the augmented `data_root` (`base_path`/`aug_subdir`).
-- `metadata_json_path` — Group-DRO only: the processed Excel metadata JSON
-  (disease groups).
-- `num_workers` — DataLoader workers (DDP and Group-DRO trainers only; the
-  plain single-GPU `Trainer` does not take it).
+- `metadata_json_path` — Group-DRO and inverse-frequency only: the processed
+  Excel metadata JSON (disease groups).
+- `num_workers` — DataLoader workers (DDP, Group-DRO and inverse-frequency
+  trainers only; the plain single-GPU `Trainer` does not take it).
 
 ### `model` (Unet3D)
 - `dim`, `cond_dim`, `channels`, `dim_mults` — passed straight through.
@@ -186,9 +192,13 @@ In DDP only rank 0 writes.
   all drawn from the one sampled group) — consider scaling `lr` if you grow
   the global batch (linear scaling is a reasonable start).
 - `lr` — eta, the model learning rate.
-- `num_steps`, `gradient_accumulate_every` (the Group-DRO trainers require 1),
-  `ema_decay`, `amp`, `save_and_sample_every`.
-- `weight_decay` — Group-DRO only: lambda, L2 weight decay in the model update.
+- `num_steps`, `gradient_accumulate_every` (the Group-DRO and inverse-frequency
+  trainers require 1), `ema_decay`, `amp`, `save_and_sample_every`.
+- `weight_decay` — Group-DRO and inverse-frequency only: lambda, L2 weight decay
+  in the model update. It is the **main knob for the inverse-frequency
+  baseline**, which has no hyperparameters of its own: Sagawa et al.'s central
+  finding is that reweighting needs strong regularization to beat plain ERM on
+  worst-group error in overparameterized models.
 - `resume` — true = load the latest checkpoint (milestone -1) before
   training, falling back to a fresh start if none exists; false = always
   start from scratch.
@@ -230,6 +240,52 @@ In DDP only rank 0 writes.
   A group is kept only if its name is a substring AND none of its `exclude`
   terms are. `exclude` is case-insensitive and position-independent.
 
+### `reweight` (inverse-frequency only)
+
+The second group-robustness baseline, beside Group-DRO. Batches are drawn from
+the **natural** training distribution (so a batch is a natural mixture of
+groups), and each sample's loss is multiplied by a **static** weight inversely
+proportional to its group's size. With `K` groups, `n_g` samples in group *g*
+and `N = sum_g n_g`:
+
+```
+w_g = (1/K) / (n_g/N) = N / (K * n_g)
+```
+
+which is the importance ratio mapping the natural group distribution onto the
+uniform one, so the objective becomes the plain average of per-group mean
+losses, `(1/K) * sum_g L_g` — a small group counts as much as a large one. The
+weights are computed once from the group counts and never change; that is the
+whole contrast with Group-DRO, which re-estimates `q` every step.
+
+The weights are normalized **within each batch** (`sum_i w_i*l_i / sum_i w_i`;
+in DDP over the global batch across all ranks), which keeps the weighted loss on
+the same scale as an unweighted one and so pins the effective learning rate. A
+side effect is that any constant factor in `w` cancels — the "INS" convention
+`(1/n_g) / sum_j(1/n_j) * K` differs from the above by exactly such a constant
+and trains identically.
+
+There are **no tuning knobs by design**; the only field is:
+
+- `allowed_disease_groups` — REQUIRED, identical semantics and ordering rules to
+  `dro.allowed_disease_groups` above (first-match-wins case-insensitive substring
+  matching, with optional `{"name", "exclude"}` vetoes). It feeds the same
+  dataset class.
+
+**Relationship to `dro.freeze_q`.** Both optimize the same objective, so do not
+mistake the two runs for duplicates — they differ in mechanism. `freeze_q` draws
+a **pure single-group batch** per step (an artifact of Group-DRO needing a
+per-group loss estimate) and leaves the loss unweighted; this baseline draws each
+sample at its natural rate and weights the loss instead. The published
+reweighting baseline is also sometimes implemented as *resampling* (a
+`WeightedRandomSampler` with weight `1/n_g` and an unweighted loss); that form is
+deliberately **not** used here, because it revisits each minority video roughly
+`K*n_maj/n_min` times as often as a majority one, which on a small dataset is
+direct memorization pressure on exactly the group the method is meant to help.
+
+On startup the trainer prints the resolved weight table next to `group counts:`,
+e.g. `inverse-frequency weights w_g = N/(K*n_g): LBBB=5.5000, Healthy=0.5500`.
+
 ### `frame_validity` (optional) — valid-frame loss masking
 Clips are resampled to `diffusion.num_frames` (e.g. 26), but a clip may only
 have the first `N` frames real and the rest padding. This block makes the
@@ -270,6 +326,15 @@ unchanged.
 On startup a trainer prints `valid-frame loss masking ON (<N> CSV entries)` when
 it is enabled (rank 0 only in DDP), so you can confirm it took effect.
 
+**One difference for inverse-frequency runs.** Those trainers ask the loss for
+per-sample values (they need one number per sample to weight), so the frame mask
+normalizes **per sample** rather than jointly over the batch: every clip is
+weighted equally, instead of in proportion to its valid-frame count as the
+batch-joint reduction does. Arguably the more correct behavior, but it is a real
+difference from the other trainers — worth noting if you compare a
+frame-masked inverse-frequency run against a frame-masked Group-DRO one. With
+`csv_path: null` (the shipped default) the two are identical.
+
 ### `logging` (optional)
 Weights & Biases loss monitoring. The whole block is optional — omit it and
 logging stays off (the code defaults to `use_wandb=false`). Console per-step
@@ -288,6 +353,16 @@ loss printing is unaffected either way.
   accumulators are not checkpointed, so they restart from zero when you resume a
   run. (In DDP the per-group loss is the GLOBAL group loss all-reduced across
   ranks.)
+
+  The inverse-frequency trainers log the same `loss_<group>` /
+  `loss_<group>_cummean` keys — deliberately, so the two baselines overlay
+  directly on one chart — plus `unweighted_loss` (the plain batch mean, for an
+  apples-to-apples curve against runs that do not reweight) and the static
+  per-group weights `w_<group>`, logged once at step 0. Here `loss` is the
+  weighted objective actually being minimized. Because the loss is computed per
+  sample, the per-group values are exact means over every sample of that group
+  seen so far, not a per-step approximation; `loss_<group>` is still sparse
+  (only groups present in that batch).
 - `wandb_project` — wandb project name the run is created under. The run is
   named after `experiment_name`, and `resume="allow"` continues the same-named
   run when you restart from a checkpoint. Defaults to

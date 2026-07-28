@@ -1,0 +1,71 @@
+{
+    "experiment_name": "proposal-26-frames-inverse-freq-bs{bs}",
+    "data": {
+        "base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames_by_disease_ratio_80_20",
+        "metadata_json_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/processed_excel.json",
+        "input_video_subdir": "dense/train/displacement_dense",
+        "contour_condition_subdir": "dense/train/dense_mask",
+        "sampling_base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames_by_disease_ratio_80_20",
+        "sampling_contour_condition_subdir": "dense/test/dense_mask",
+        "num_workers": 4
+    },
+    "model": {
+        "dim": 48,
+        "cond_dim": null,
+        "channels": 2,
+        "dim_mults": [
+            1,
+            2,
+            4,
+            8
+        ]
+    },
+    "diffusion": {
+        "image_size": 64,
+        "num_frames": 26,
+        "channels": 2,
+        "timesteps": 1000,
+        "loss_type": "l2",
+        "contour_noise_only": false
+    },
+    "training": {
+        "per_gpu_batch_size": 8,
+        "lr": 2e-05,
+        "num_steps": 700000,
+        "gradient_accumulate_every": 1,
+        "ema_decay": 0.995,
+        "amp": true,
+        "save_and_sample_every": 300,
+        "weight_decay": 0,
+        "resume": true
+    },
+    "reweight": {
+        "_comment": "Inverse-frequency reweighting. Per-sample loss weight w_g = N/(K*n_g) -- the importance ratio (1/K)/(n_g/N) that maps the natural group distribution onto the uniform one -- normalized over the GLOBAL batch (all ranks). Every disease group then contributes equally in expectation. There are NO tuning knobs by design: the weights follow entirely from the group counts, and need no rescaling with the number of GPUs. training.weight_decay is the main knob for this baseline.",
+        "_comment_allowed_disease_groups": "Order = string-match PRIORITY (first match wins). Entries are a group name string, or {name, exclude:[terms]} where exclude terms VETO the match. Here Healthy absorbs e.g. 'Healthy Cardiotoxicity' but drops 'Healthy Pediatric' (excluded by 'Pediatric'). A more specific name must precede a broader one. Identical semantics to dro.allowed_disease_groups.",
+        "_available_disease_groups": [
+            "Acute MI",
+            "Myocarditis",
+            "DCM"
+        ],
+        "allowed_disease_groups": [
+            "LBBB",
+            {
+                "name": "Healthy",
+                "exclude": [
+                    "Pediatric"
+                ]
+            }
+        ]
+    },
+    "logging": {
+        "use_wandb": true,
+        "wandb_project": "genstrain-motion-diffusion"
+    },
+    "frame_validity": {
+        "_comment": "set csv_path to this dataset's frame-counts CSV to mask padding frames in the loss; null = off (all frames)",
+        "csv_path": null,
+        "filename_col": "dense_filename",
+        "valid_frames_col": "dense_valid_frames",
+        "missing": "error"
+    }
+}
