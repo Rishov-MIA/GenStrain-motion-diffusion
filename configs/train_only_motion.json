@@ -32,6 +32,9 @@
         "ema_decay": 0.995,
         "amp": true,
         "save_and_sample_every": 500,
+        "preview_sampler": "ddpm",
+        "preview_ddim_steps": 50,
+        "preview_ddim_eta": 0.0,
         "resume": false
     },
     "logging": {

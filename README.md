@@ -128,5 +128,24 @@ Arguments:
 
 - `--video_type`: `cine`, `dense`, `paired_cine`, `paired_dense`
 - `--start`, `--end`: index range for videos in the contour/mask folder (optional)
+- `--sampler`: `ddpm` (default) or `ddim`
+- `--ddim_steps`, `--ddim_eta`: DDIM step count and stochasticity (only used with `--sampler ddim`)
+
+### Faster sampling with DDIM
+
+By default sampling walks all `timesteps` (1000) denoising steps. `--sampler ddim`
+walks a strided subsequence of the same chain instead, so one video costs
+`--ddim_steps` network calls rather than 1000 — roughly a `1000 / ddim_steps`
+speedup. It reuses the **same trained checkpoint**; there is nothing to retrain.
+
+```bash
+python inference.py --video_type cine --sampler ddim --ddim_steps 50
+```
+
+`ddim_eta=0` (the default) is the deterministic path; `ddim_eta=1` reproduces the
+DDPM posterior noise level. DDPM remains the default so existing results are
+unchanged — fewer steps trades fidelity for speed, so sweep `--ddim_steps`
+against the DDPM output on a few videos before running a whole split. See
+[configs/README.md](configs/README.md) for the config fields.
 
 Outputs are saved to `./<exp_name>/sampling_time_sampled_<video_type>_part_videos_infos/` and the folder is created automatically. Update `custom_save_folder` in `inference.py` if you want a different location.

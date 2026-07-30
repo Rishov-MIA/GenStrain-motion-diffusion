@@ -875,8 +875,71 @@ class GaussianDiffusion(nn.Module):
 
         return unnormalize_divide_by_5(img)
 
+    def ddim_timestep_pairs(self, ddim_steps):
+        """(t, t_prev) pairs for a uniformly spaced DDIM subsequence of the full
+        training chain, walked from noisiest to cleanest. The last pair ends at
+        -1, which stands for alphas_cumprod_prev = 1 (i.e. fully denoised)."""
+        # Guard the silent failure: ddim_steps <= 0 yields an empty pair list, so
+        # the sample loop would return the initial noise as if it had denoised it.
+        if not 1 <= ddim_steps <= self.num_timesteps:
+            raise ValueError(f"ddim_steps must be in [1, {self.num_timesteps}], got {ddim_steps}")
+
+        times = torch.linspace(-1, self.num_timesteps - 1, steps=ddim_steps + 1)
+        times = list(reversed(times.long().tolist()))
+        return list(zip(times[:-1], times[1:]))
+
     @torch.inference_mode()
-    def sample(self, cond=None, cond_scale=1.0, batch_size=16):
+    def ddim_sample_loop(self, shape, cond=None, cond_scale=1.0, ddim_steps=50, ddim_eta=0.0):
+        """DDIM sampler over a subsequence of the training chain. Uses the same
+        trained eps-prediction network as `p_sample_loop` with no retraining,
+        for `num_timesteps / ddim_steps` times fewer denoise_fn calls.
+        `ddim_eta=0` is the deterministic ODE path; `ddim_eta=1` recovers
+        DDPM-like posterior noise."""
+        device = self.betas.device
+
+        b = shape[0]
+        img = torch.randn(shape, device=device)
+
+        # When contour_noise_only, compute noise mask and apply to initial noise
+        noise_mask = None
+        if self.contour_noise_only and cond is not None and isinstance(cond[0], torch.Tensor):
+            noise_mask = extract_noise_mask_from_first_frame(cond[0])  # [B, 1, F, H, W]
+            img = img * noise_mask  # start with noise only in contour region
+
+        time_pairs = self.ddim_timestep_pairs(ddim_steps)
+
+        for time, time_prev in tqdm(time_pairs, desc="ddim sampling loop time step", total=len(time_pairs)):
+            t = torch.full((b,), time, device=device, dtype=torch.long)
+            pred_noise = self.denoise_fn.forward_with_cond_scale(img, t, cond=[cond[0]], cond_scale=cond_scale)
+
+            # No thresholding here, to stay comparable with p_mean_variance,
+            # whose clamp is commented out.
+            x_start = self.predict_start_from_noise(img, t=t, noise=pred_noise)
+
+            alpha = self.alphas_cumprod[time]
+            alpha_prev = self.alphas_cumprod[time_prev] if time_prev >= 0 else torch.ones_like(alpha)
+
+            sigma = ddim_eta * ((1 - alpha_prev) / (1 - alpha)).sqrt() * (1 - alpha / alpha_prev).sqrt()
+            dir_coef = (1 - alpha_prev - sigma**2).clamp(min=0.0).sqrt()
+
+            img = alpha_prev.sqrt() * x_start + dir_coef * pred_noise
+
+            # no noise on the final step (time_prev == -1), matching p_sample
+            if ddim_eta > 0 and time_prev >= 0:
+                noise = torch.randn_like(img)
+                # Mask stochastic noise to contour region only
+                if noise_mask is not None:
+                    noise = noise * noise_mask
+                img = img + sigma * noise
+
+            # Zero out non-contour pixels to prevent unconstrained predictions from accumulating
+            if noise_mask is not None:
+                img = img * noise_mask
+
+        return unnormalize_divide_by_5(img)
+
+    @torch.inference_mode()
+    def sample(self, cond=None, cond_scale=1.0, batch_size=16, sampler="ddpm", ddim_steps=50, ddim_eta=0.0):
         device = next(self.denoise_fn.parameters()).device
 
         if is_list_str(cond):
@@ -888,9 +951,16 @@ class GaussianDiffusion(nn.Module):
         image_size = self.image_size
         channels = self.channels
         num_frames = self.num_frames
-        return self.p_sample_loop(
-            (batch_size, channels, num_frames, image_size, image_size), cond=[contour_cond_video], cond_scale=cond_scale
-        )
+        shape = (batch_size, channels, num_frames, image_size, image_size)
+        cond = [contour_cond_video]
+
+        if sampler == "ddpm":
+            return self.p_sample_loop(shape, cond=cond, cond_scale=cond_scale)
+        if sampler == "ddim":
+            return self.ddim_sample_loop(
+                shape, cond=cond, cond_scale=cond_scale, ddim_steps=ddim_steps, ddim_eta=ddim_eta
+            )
+        raise ValueError(f"unknown sampler {sampler!r}, expected 'ddpm' or 'ddim'")
 
     @torch.inference_mode()
     def interpolate(self, x1, x2, t=None, lam=0.5):
@@ -1274,6 +1344,28 @@ def random_pick_condition_videos(num_samples, contour_cond_video_dir):
 
 
 class Trainer(object):
+    # Sampler for the periodic preview samples taken every `save_and_sample_every`
+    # training steps. These are CLASS attributes rather than set in __init__ so
+    # that every Trainer subclass has them — including the DDP trainers, which
+    # deliberately skip super().__init__(). Named preview_* because `self.sampler`
+    # is already the DDP DistributedSampler.
+    preview_sampler = "ddpm"
+    preview_ddim_steps = 50
+    preview_ddim_eta = 0.0
+
+    def configure_preview_sampler(self, sampler="ddpm", ddim_steps=50, ddim_eta=0.0):
+        """Choose the sampler used for training-time preview samples. Validates at
+        startup rather than letting a bad value fail at the first sampling step,
+        thousands of steps into a run."""
+        if sampler not in ("ddpm", "ddim"):
+            raise ValueError(f"unknown preview sampler {sampler!r}, expected 'ddpm' or 'ddim'")
+        num_timesteps = getattr(self.model, "num_timesteps", None)
+        if sampler == "ddim" and num_timesteps is not None and not 1 <= ddim_steps <= num_timesteps:
+            raise ValueError(f"preview ddim_steps must be in [1, {num_timesteps}], got {ddim_steps}")
+        self.preview_sampler = sampler
+        self.preview_ddim_steps = ddim_steps
+        self.preview_ddim_eta = ddim_eta
+
     def __init__(
         self,
         diffusion_model,
@@ -1572,6 +1664,9 @@ class Trainer(object):
                     contour_cond_video=sample_contour_cond,
                     cond_filenames=sample_cond_filenames,
                     save_folder=f"./{self.experiment_name}/sampled_videos_infos",
+                    sampler=self.preview_sampler,
+                    ddim_steps=self.preview_ddim_steps,
+                    ddim_eta=self.preview_ddim_eta,
                 )
 
             if self.use_wandb:
@@ -1595,12 +1690,22 @@ class Trainer(object):
         cond_filenames=None,
         cond_scale=2.0,
         save_folder="./sampled_videos_infos",
+        sampler="ddpm",
+        ddim_steps=50,
+        ddim_eta=0.0,
     ):
         # Number of samples to generate
         # cond video shape [num_samples, 1, F, H, W]
         num_samples = contour_cond_video.shape[0]
 
-        sampled_videos = self.ema_model.sample(cond=[contour_cond_video], cond_scale=cond_scale, batch_size=num_samples)
+        sampled_videos = self.ema_model.sample(
+            cond=[contour_cond_video],
+            cond_scale=cond_scale,
+            batch_size=num_samples,
+            sampler=sampler,
+            ddim_steps=ddim_steps,
+            ddim_eta=ddim_eta,
+        )
         sampled_videos = sampled_videos.cpu().numpy() # [num_samples, 2, F, H, W]
         sampled_videos = np.expand_dims(sampled_videos, axis=1) # [num_samples, 1, 2, F, H, W]
         # to unnormalize it multiply with 255.0
@@ -1650,12 +1755,22 @@ class Trainer(object):
         gt_disp=None,
         cond_scale=2.0,
         save_folder="./sampled_videos_infos",
+        sampler="ddpm",
+        ddim_steps=50,
+        ddim_eta=0.0,
     ):
         # Number of samples to generate
         # cond video shape [num_samples, 1, F, H, W]
         num_samples = contour_cond_video.shape[0]
 
-        sampled_videos = self.ema_model.sample(cond=[contour_cond_video], cond_scale=cond_scale, batch_size=num_samples)
+        sampled_videos = self.ema_model.sample(
+            cond=[contour_cond_video],
+            cond_scale=cond_scale,
+            batch_size=num_samples,
+            sampler=sampler,
+            ddim_steps=ddim_steps,
+            ddim_eta=ddim_eta,
+        )
         sampled_videos = sampled_videos.cpu().numpy() # [num_samples, 2, F, H, W]
         sampled_videos = np.expand_dims(sampled_videos, axis=1) # [num_samples, 1, 2, F, H, W]
         # to unnormalize it multiply with 255.0

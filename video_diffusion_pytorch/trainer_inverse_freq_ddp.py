@@ -469,6 +469,9 @@ class InverseFrequencyDDPTrainer(InverseFrequencyTrainer):
                         contour_cond_video=sample_contour_cond,
                         cond_filenames=sample_cond_filenames,
                         save_folder=f"./{self.experiment_name}/sampled_videos_infos",
+                        sampler=self.preview_sampler,
+                        ddim_steps=self.preview_ddim_steps,
+                        ddim_eta=self.preview_ddim_eta,
                     )
 
             if self.use_wandb:

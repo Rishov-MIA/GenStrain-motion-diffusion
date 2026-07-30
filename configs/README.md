@@ -43,6 +43,7 @@ the CLI to override the config for a single run:
 ```bash
 python inference.py --config configs/inference.json
 python inference.py --video_type dense --start 0 --end 50   # override the config's inference block
+python inference.py --sampler ddim --ddim_steps 50          # few-step sampling, same weights
 ```
 
 | Config | Script | Variant |
@@ -202,6 +203,37 @@ In DDP only rank 0 writes.
 - `resume` — true = load the latest checkpoint (milestone -1) before
   training, falling back to a fresh start if none exists; false = always
   start from scratch.
+- `preview_sampler`, `preview_ddim_steps`, `preview_ddim_eta` — sampler for the
+  **preview sample taken every `save_and_sample_every` steps**, independent of
+  the `inference` block. Same meaning as the inference fields, and `ddpm` is the
+  default here too. See [Preview sampling during training](#preview-sampling-during-training).
+
+### Preview sampling during training
+Every `save_and_sample_every` steps the trainer saves a checkpoint and samples
+one preview video. Under `preview_sampler: "ddpm"` that preview costs a full
+`diffusion.timesteps` (1000) network calls, and it is **not free** — on a
+700k-step run with `save_and_sample_every: 300` that is ~2,333 previews x 1000
+steps = ~2.3M extra forward passes, on the order of 10% of training wall-clock.
+Under DDP it is worse than it looks: only rank 0 samples, so every other rank
+sits at the next collective until it finishes.
+
+Setting `preview_sampler: "ddim"` with `preview_ddim_steps: 50` cuts that to
+~117k forward passes, recovering most of the overhead:
+
+```json
+"training": {
+    "save_and_sample_every": 300,
+    "preview_sampler": "ddim",
+    "preview_ddim_steps": 50,
+    "preview_ddim_eta": 0.0
+}
+```
+
+The trade-off is that previews then no longer show exactly what full DDPM
+inference would produce, so treat them as a progress signal rather than a
+fidelity check. `ddpm` remains the default so training behaviour is unchanged
+unless you opt in. Bad values are rejected at startup, not at the first preview
+thousands of steps in.
 
 ### `dro` (Group-DRO only)
 - `eta_q` — group-weight learning rate. The q update multiplies a group's raw
@@ -370,16 +402,55 @@ loss printing is unaffected either way.
 
 ### `inference` (inference configs only)
 Per-run runtime knobs for the `inference_*.py` scripts. Each field also has a
-matching CLI flag (`--video_type`, `--start`, `--end`, `--milestone`); when the
-flag is passed it wins, otherwise the config value is used. On startup each
-inference script also saves a config snapshot to
-`./{experiment_name}/config.json` (see [Config tracking](#config-tracking)).
+matching CLI flag (`--video_type`, `--start`, `--end`, `--milestone`,
+`--sampler`, `--ddim_steps`, `--ddim_eta`); when the flag is passed it wins,
+otherwise the config value is used. On startup each inference script also saves
+a config snapshot to `./{experiment_name}/config.json`
+(see [Config tracking](#config-tracking)).
 - `milestone` — checkpoint milestone to load; `-1` = the latest checkpoint.
 - `video_type` — which test split to sample conditions from: `cine` or `dense`.
   `dense` also loads ground-truth displacement (from `gt_disp_dense_subdir`) so
   it can be saved alongside the sample; `cine` has no ground truth.
-- `start`, `end` — index range into the sorted list of condition `.npy` files
-  to sample; `end: null` means "through the last file".
+- `start`, `end` — index range into the sorted list of condition `.npy` files to
+  sample. Every config ships with `start: 0` / `end: null`, i.e. **all videos in
+  the folder**; `end: null` means "through the last file". Narrow the range only
+  to sample a subset — and note `run_inference_multi_gpu.py` sets it per worker,
+  so leave it open there.
+- `sampler` — `ddpm` (default) or `ddim`. See
+  [Choosing a sampler](#choosing-a-sampler) below.
+- `ddim_steps` — number of denoising steps when `sampler` is `ddim`. Ignored
+  under `ddpm`, which always walks all `diffusion.timesteps` steps.
+- `ddim_eta` — DDIM stochasticity when `sampler` is `ddim`. `0.0` (default) is
+  the deterministic path; `1.0` reproduces the DDPM posterior noise level.
+  Ignored under `ddpm`.
+
+### Choosing a sampler
+Both samplers run the **same trained weights** — DDIM needs no retraining and no
+checkpoint changes. The difference is only how many times the network is called
+to denoise one video:
+
+| `sampler` | denoise calls | notes |
+| --- | --- | --- |
+| `ddpm` (default) | `diffusion.timesteps` (1000) | the original ancestral sampler; unchanged, still the reference output |
+| `ddim` | `ddim_steps` | strided subsequence of the same chain; ~`1000 / ddim_steps` faster |
+
+`ddpm` stays the default so existing runs and saved results are untouched. Reach
+for `ddim` when sampling a whole test split is the bottleneck:
+
+```bash
+# 50 steps instead of 1000, deterministic
+python inference_full_region.py --sampler ddim --ddim_steps 50
+
+# shard the same DDIM run across GPUs
+python run_inference_multi_gpu.py --script inference_full_region.py \
+    --sampler ddim --ddim_steps 50
+```
+
+`ddim_steps` trades speed for fidelity, so **sweep it against your DDPM baseline
+on a few videos before trusting it for a full split** — compare the saved
+`inference_disps/*.npy` against the `ddpm` output for the same conditions and
+pick the smallest step count whose displacement error is acceptable. 50 is a
+common starting point, not a validated default for this data.
 
 ### inference `data` subdir keys
 The inference configs reuse the training `data` keys and add a few for the

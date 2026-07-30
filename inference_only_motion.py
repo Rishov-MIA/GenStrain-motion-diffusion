@@ -5,7 +5,7 @@ Run a different setup by pointing at another config:
 
     python inference_only_motion.py --config configs/my_inference.json
 
-The per-run runtime knobs (video_type, start, end, milestone) default to the
+The per-run runtime knobs (video_type, start, end, milestone, sampler, ddim_steps, ddim_eta) default to the
 config's `inference` block but can be overridden on the CLI:
 
     python inference_only_motion.py --video_type dense --start 0 --end 50
@@ -55,6 +55,13 @@ def parse_args():
     parser.add_argument('--start', type=int, default=None, help='start index')
     parser.add_argument('--end', type=int, default=None, help='end index')
     parser.add_argument('--milestone', type=int, default=None, help='checkpoint milestone (-1 = latest)')
+    parser.add_argument('--sampler', type=str, default=None, choices=['ddpm', 'ddim'],
+                        help="sampler: 'ddpm' = full-chain ancestral sampling (default), "
+                             "'ddim' = strided, uses ddim_steps denoise calls instead of diffusion.timesteps")
+    parser.add_argument('--ddim_steps', type=int, default=None,
+                        help='number of DDIM steps; ignored unless --sampler ddim')
+    parser.add_argument('--ddim_eta', type=float, default=None,
+                        help='DDIM stochasticity, 0.0 = deterministic; ignored unless --sampler ddim')
     parser.add_argument('--no_config_snapshot', action='store_true',
                         help='skip writing the config snapshot (set by the multi-GPU launcher on all but one worker to avoid a concurrent-write race)')
     return parser.parse_args()
@@ -104,6 +111,9 @@ def main():
     start = args.start if args.start is not None else infer_cfg.get("start", 0)
     end = args.end if args.end is not None else infer_cfg.get("end", None)
     milestone = args.milestone if args.milestone is not None else infer_cfg.get("milestone", -1)
+    sampler = args.sampler if args.sampler is not None else infer_cfg.get("sampler", "ddpm")
+    ddim_steps = args.ddim_steps if args.ddim_steps is not None else infer_cfg.get("ddim_steps", 50)
+    ddim_eta = args.ddim_eta if args.ddim_eta is not None else infer_cfg.get("ddim_eta", 0.0)
 
     if not args.no_config_snapshot:
         save_config_snapshot(cfg, cfg["experiment_name"])
@@ -163,12 +173,12 @@ def main():
         # Generate samples
         if video_type == "cine":
             reconstructed_disp = None
-            trainer.sample_and_save_one_video_at_a_time("final", motion_cond_video, cond_filename, reconstructed_disp, None, save_folder=custom_save_folder)
+            trainer.sample_and_save_one_video_at_a_time("final", motion_cond_video, cond_filename, reconstructed_disp, None, save_folder=custom_save_folder, sampler=sampler, ddim_steps=ddim_steps, ddim_eta=ddim_eta)
         elif video_type == "dense":
             gt_disp_dir = str(base_path / data_cfg["gt_disp_dense_subdir"])
             gt_disp = np.load(os.path.join(gt_disp_dir, cond_filename[0]))
             reconstructed_disp = None
-            trainer.sample_and_save_one_video_at_a_time("final", motion_cond_video, cond_filename, reconstructed_disp, gt_disp, save_folder=custom_save_folder)
+            trainer.sample_and_save_one_video_at_a_time("final", motion_cond_video, cond_filename, reconstructed_disp, gt_disp, save_folder=custom_save_folder, sampler=sampler, ddim_steps=ddim_steps, ddim_eta=ddim_eta)
 
 
 if __name__ == "__main__":

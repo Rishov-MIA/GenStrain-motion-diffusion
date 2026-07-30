@@ -157,6 +157,13 @@ def main():
                 print("no checkpoint found, starting from scratch")
 
     try:
+        # Sampler for the periodic preview samples taken during training.
+        # Defaults to ddpm, i.e. unchanged behaviour (see configs/README.md).
+        trainer.configure_preview_sampler(
+            sampler=train_cfg.get("preview_sampler", "ddpm"),
+            ddim_steps=train_cfg.get("preview_ddim_steps", 50),
+            ddim_eta=train_cfg.get("preview_ddim_eta", 0.0),
+        )
         trainer.train()
     finally:
         cleanup_distributed()

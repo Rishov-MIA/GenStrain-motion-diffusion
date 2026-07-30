@@ -63,6 +63,12 @@ def parse_args():
     parser.add_argument("--video_type", type=str, default=None,
                         help="override video_type for every worker (else the config's value)")
     parser.add_argument("--milestone", type=int, default=None, help="override checkpoint milestone for every worker")
+    parser.add_argument("--sampler", type=str, default=None, choices=["ddpm", "ddim"],
+                        help="override the sampler for every worker (else the config's value, default ddpm)")
+    parser.add_argument("--ddim_steps", type=int, default=None,
+                        help="override ddim_steps for every worker; ignored unless the sampler is ddim")
+    parser.add_argument("--ddim_eta", type=float, default=None,
+                        help="override ddim_eta for every worker; ignored unless the sampler is ddim")
     parser.add_argument("--start", type=int, default=None,
                         help="only shard the [start:end) window of the file list (default: whole list)")
     parser.add_argument("--end", type=int, default=None,
@@ -187,6 +193,12 @@ def main():
         ]
         if args.milestone is not None:
             cmd += ["--milestone", str(args.milestone)]
+        if args.sampler is not None:
+            cmd += ["--sampler", args.sampler]
+        if args.ddim_steps is not None:
+            cmd += ["--ddim_steps", str(args.ddim_steps)]
+        if args.ddim_eta is not None:
+            cmd += ["--ddim_eta", str(args.ddim_eta)]
         # Every worker calls save_config_snapshot on the SAME ./{experiment}/config.json.
         # Concurrently that races (one renames it to a backup, the rest hit
         # FileNotFoundError). Let only the first worker write it; the rest skip.

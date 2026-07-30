@@ -40,6 +40,9 @@
         "milestone": -1,
         "video_type": "dense",
         "start": 0,
-        "end": null
+        "end": null,
+        "sampler": "ddpm",
+        "ddim_steps": 50,
+        "ddim_eta": 0.0
     }
 }
