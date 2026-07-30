@@ -1,11 +1,11 @@
 {
     "experiment_name": "proposal-26-frames-inverse-freq-bs{bs}",
     "data": {
-        "base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames_by_disease_ratio_80_20",
-        "metadata_json_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/processed_excel.json",
+        "base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank v1/proposal-genstrain-new/all_data_resampled_26_frames_by_disease_ratio_80_20",
+        "metadata_json_path": "/scratch/vst2hb/Dataset_Processing/Data Bank v1/proposal-genstrain-new/processed_excel.json",
         "input_video_subdir": "dense/train/displacement_dense",
         "contour_condition_subdir": "dense/train/dense_mask",
-        "sampling_base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames_by_disease_ratio_80_20",
+        "sampling_base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank v1/proposal-genstrain-new/all_data_resampled_26_frames_by_disease_ratio_80_20",
         "sampling_contour_condition_subdir": "dense/test/dense_mask",
         "num_workers": 4
     },

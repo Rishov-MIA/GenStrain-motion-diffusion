@@ -1,11 +1,11 @@
 {
-    "experiment_name": "proposal-26-frames-group-dro-etaq{eta_q}-c{adjustment_c}-bs{bs}",
+    "experiment_name": "proposal-26-frames-v1-aug-group-dro-etaq{eta_q}-c{adjustment_c}-bs{bs}",
     "data": {
-        "base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames_by_disease_ratio_80_20",
-        "metadata_json_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/processed_excel.json",
+        "base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank v1/proposal-genstrain-new/all_data_resampled_26_frames_augmented_by_disease_ratio/aug_8x",
+        "metadata_json_path": "/scratch/vst2hb/Dataset_Processing/Data Bank v1/proposal-genstrain-new/processed_excel.json",
         "input_video_subdir": "dense/train/displacement_dense",
         "contour_condition_subdir": "dense/train/dense_mask",
-        "sampling_base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames_by_disease_ratio_80_20",
+        "sampling_base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank v1/proposal-genstrain-new/all_data_resampled_26_frames_by_disease_ratio_80_20",
         "sampling_contour_condition_subdir": "dense/test/dense_mask",
         "num_workers": 4
     },
@@ -40,8 +40,8 @@
         "resume": true
     },
     "dro": {
-        "eta_q": 0.0001,
-        "adjustment_c": 20,
+        "eta_q": 0.001,
+        "adjustment_c": 0.5,
         "freeze_q": false,
         "_comment_allowed_disease_groups": "Order = string-match PRIORITY (first match wins). Entries are a group name string, or {name, exclude:[terms]} where exclude terms VETO the match. Here Healthy absorbs e.g. 'Healthy Cardiotoxicity' but drops 'Healthy Pediatric' (excluded by 'Pediatric'). A more specific name must precede a broader one.",
         "_available_disease_groups": [
