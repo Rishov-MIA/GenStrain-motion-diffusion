@@ -137,6 +137,9 @@ def main():
         ddim_steps=train_cfg.get("preview_ddim_steps", 50),
 
         ddim_eta=train_cfg.get("preview_ddim_eta", 0.0),
+        spacing=train_cfg.get("preview_ddim_spacing", "uniform"),
+        clip_x_start=train_cfg.get("preview_ddim_clip_x_start", None),
+        clip_percentile=train_cfg.get("preview_ddim_clip_percentile", 0.995),
 
     )
 

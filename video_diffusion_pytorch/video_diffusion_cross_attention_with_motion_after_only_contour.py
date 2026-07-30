@@ -856,11 +856,16 @@ class GaussianDiffusion(nn.Module):
         return result
 
     @torch.inference_mode()
-    def p_sample_loop(self, shape, cond=None, cond_scale=1.0):
+    def p_sample_loop(self, shape, cond=None, cond_scale=1.0, seed=None):
         device = self.betas.device
 
         b = shape[0]
-        img = torch.randn(shape, device=device)
+        # seed=None keeps the original unseeded draw. A seed fixes x_T so two runs
+        # differ only by the sampler settings — required to compare step counts.
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=device).manual_seed(int(seed))
+        img = torch.randn(shape, device=device, generator=generator)
 
         # When contour_noise_only, compute noise mask and apply to initial noise
         noise_mask = None
@@ -875,21 +880,98 @@ class GaussianDiffusion(nn.Module):
 
         return unnormalize_divide_by_5(img)
 
-    def ddim_timestep_pairs(self, ddim_steps):
-        """(t, t_prev) pairs for a uniformly spaced DDIM subsequence of the full
-        training chain, walked from noisiest to cleanest. The last pair ends at
-        -1, which stands for alphas_cumprod_prev = 1 (i.e. fully denoised)."""
+    def ddim_timestep_pairs(self, ddim_steps, spacing="uniform", start_t=None):
+        """(t, t_prev) pairs for a DDIM subsequence of the full training chain,
+        walked from noisiest to cleanest. The last pair ends at -1, which stands
+        for alphas_cumprod_prev = 1 (i.e. fully denoised).
+
+        spacing:
+          "uniform" — evenly spaced in t (the DDIM paper's default).
+          "logsnr"  — evenly spaced in log-SNR. The cosine schedule packs an
+                      enormous log-SNR range into the top of the chain, so
+                      uniform-in-t strides are coarsest exactly where the
+                      trajectory curves most. This spends steps where the noise
+                      level actually moves, which is usually what lets a coarse
+                      step count work.
+        """
+        # start_t skips the top of the chain. `cosine_beta_schedule` clips betas at
+        # 0.9999, so beta[T-1] is ~0.9999 and alphas_cumprod falls ~10,000x in that
+        # single step; predict_start_from_noise then scales x0 by 1/sqrt(a_cumprod),
+        # i.e. ~64,000x at t=999 versus ~642x at t=998. DDPM's posterior damps that
+        # garbage x0; DDIM does not, and NO step count avoids the hop -- even 1000
+        # steps takes 999->998. Starting one step lower drops the amplification
+        # ~100x. It is a safe initialisation: alphas_cumprod[998] ~ 2.4e-6, so the
+        # true x_998 is pure noise to within ~0.15%, which is what we seed anyway.
+        start_t = self.num_timesteps - 1 if start_t is None else int(start_t)
+        if not 0 <= start_t <= self.num_timesteps - 1:
+            raise ValueError(f"ddim_start_t must be in [0, {self.num_timesteps - 1}], got {start_t}")
+
         # Guard the silent failure: ddim_steps <= 0 yields an empty pair list, so
         # the sample loop would return the initial noise as if it had denoised it.
-        if not 1 <= ddim_steps <= self.num_timesteps:
-            raise ValueError(f"ddim_steps must be in [1, {self.num_timesteps}], got {ddim_steps}")
+        if not 1 <= ddim_steps <= start_t + 1:
+            raise ValueError(f"ddim_steps must be in [1, {start_t + 1}] for start_t={start_t}, got {ddim_steps}")
 
-        times = torch.linspace(-1, self.num_timesteps - 1, steps=ddim_steps + 1)
-        times = list(reversed(times.long().tolist()))
+        if spacing == "uniform":
+            times = torch.linspace(-1, start_t, steps=ddim_steps + 1)
+            times = list(reversed(times.long().tolist()))
+        elif spacing == "logsnr":
+            # log-SNR is strictly decreasing in t, so walking targets from the
+            # noisiest end gives timesteps in descending order.
+            log_snr = (self.alphas_cumprod / (1.0 - self.alphas_cumprod)).log()
+            targets = torch.linspace(
+                log_snr[start_t].item(), log_snr[0].item(), steps=ddim_steps
+            )
+            times = []
+            for target in targets.tolist():
+                t = int((log_snr - target).abs().argmin().item())
+                # argmin can repeat once ddim_steps approaches num_timesteps; keep
+                # the sequence strictly descending rather than stalling on a t.
+                if not times or t < times[-1]:
+                    times.append(t)
+            times.append(-1)
+        else:
+            raise ValueError(f"unknown ddim spacing {spacing!r}, expected 'uniform' or 'logsnr'")
+
         return list(zip(times[:-1], times[1:]))
 
+    def clip_x_start(self, x_start, mode=None, percentile=0.995):
+        """Bound the predicted x0 during DDIM sampling.
+
+        `predict_start_from_noise` scales by ~1/sqrt(alphas_cumprod[t]), which is
+        ~6.5e4 at t=999 under the cosine schedule, so a small eps error becomes an
+        enormous x0 error near the top of the chain. DDPM's posterior coefficients
+        damp that; DDIM at eta=0 does not — the first step's x0 sets the whole
+        trajectory. Bounding x0 is what keeps coarse strides stable.
+
+        mode:
+          None        — no clipping (the original behaviour).
+          "dynamic"   — per-sample percentile clamp of |x0|, with NO rescale. The
+                        Imagen-style `clamp(-s, s) / s` assumes [-1, 1] data;
+                        these displacement fields are normalized by /5, so the
+                        rescale would change their scale. This is a pure
+                        outlier clip and is scale-agnostic.
+          float       — clamp to [-value, value] in normalized units.
+        """
+        if mode is None:
+            return x_start
+
+        if mode == "dynamic":
+            s = torch.quantile(
+                rearrange(x_start, "b ... -> b (...)").abs().float(), percentile, dim=-1
+            )
+            s = s.view(-1, *((1,) * (x_start.ndim - 1))).to(x_start.dtype)
+            return x_start.clamp(min=-s, max=s)
+
+        if isinstance(mode, str):
+            raise ValueError(f"unknown clip_x_start {mode!r}, expected None, 'dynamic' or a float")
+
+        bound = abs(float(mode))
+        return x_start.clamp(-bound, bound)
+
     @torch.inference_mode()
-    def ddim_sample_loop(self, shape, cond=None, cond_scale=1.0, ddim_steps=50, ddim_eta=0.0):
+    def ddim_sample_loop(self, shape, cond=None, cond_scale=1.0, ddim_steps=50, ddim_eta=0.0,
+                         spacing="uniform", clip_x_start=None, clip_percentile=0.995,
+                         start_t=None, seed=None):
         """DDIM sampler over a subsequence of the training chain. Uses the same
         trained eps-prediction network as `p_sample_loop` with no retraining,
         for `num_timesteps / ddim_steps` times fewer denoise_fn calls.
@@ -898,7 +980,12 @@ class GaussianDiffusion(nn.Module):
         device = self.betas.device
 
         b = shape[0]
-        img = torch.randn(shape, device=device)
+        # seed=None keeps the original unseeded draw. A seed fixes x_T so two runs
+        # differ only by the sampler settings — required to compare step counts.
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=device).manual_seed(int(seed))
+        img = torch.randn(shape, device=device, generator=generator)
 
         # When contour_noise_only, compute noise mask and apply to initial noise
         noise_mask = None
@@ -906,15 +993,16 @@ class GaussianDiffusion(nn.Module):
             noise_mask = extract_noise_mask_from_first_frame(cond[0])  # [B, 1, F, H, W]
             img = img * noise_mask  # start with noise only in contour region
 
-        time_pairs = self.ddim_timestep_pairs(ddim_steps)
+        time_pairs = self.ddim_timestep_pairs(ddim_steps, spacing=spacing, start_t=start_t)
 
         for time, time_prev in tqdm(time_pairs, desc="ddim sampling loop time step", total=len(time_pairs)):
             t = torch.full((b,), time, device=device, dtype=torch.long)
             pred_noise = self.denoise_fn.forward_with_cond_scale(img, t, cond=[cond[0]], cond_scale=cond_scale)
 
-            # No thresholding here, to stay comparable with p_mean_variance,
-            # whose clamp is commented out.
             x_start = self.predict_start_from_noise(img, t=t, noise=pred_noise)
+            # Off by default, so this stays comparable with p_mean_variance (whose
+            # clamp is commented out). Turn it on when coarse strides misbehave.
+            x_start = self.clip_x_start(x_start, mode=clip_x_start, percentile=clip_percentile)
 
             alpha = self.alphas_cumprod[time]
             alpha_prev = self.alphas_cumprod[time_prev] if time_prev >= 0 else torch.ones_like(alpha)
@@ -926,7 +1014,7 @@ class GaussianDiffusion(nn.Module):
 
             # no noise on the final step (time_prev == -1), matching p_sample
             if ddim_eta > 0 and time_prev >= 0:
-                noise = torch.randn_like(img)
+                noise = torch.randn(img.shape, device=img.device, dtype=img.dtype, generator=generator)
                 # Mask stochastic noise to contour region only
                 if noise_mask is not None:
                     noise = noise * noise_mask
@@ -939,7 +1027,9 @@ class GaussianDiffusion(nn.Module):
         return unnormalize_divide_by_5(img)
 
     @torch.inference_mode()
-    def sample(self, cond=None, cond_scale=1.0, batch_size=16, sampler="ddpm", ddim_steps=50, ddim_eta=0.0):
+    def sample(self, cond=None, cond_scale=1.0, batch_size=16, sampler="ddpm", ddim_steps=50,
+               ddim_eta=0.0, ddim_spacing="uniform", ddim_clip_x_start=None,
+               ddim_clip_percentile=0.995, ddim_start_t=None, seed=None):
         device = next(self.denoise_fn.parameters()).device
 
         if is_list_str(cond):
@@ -955,10 +1045,19 @@ class GaussianDiffusion(nn.Module):
         cond = [contour_cond_video]
 
         if sampler == "ddpm":
-            return self.p_sample_loop(shape, cond=cond, cond_scale=cond_scale)
+            return self.p_sample_loop(shape, cond=cond, cond_scale=cond_scale, seed=seed)
         if sampler == "ddim":
             return self.ddim_sample_loop(
-                shape, cond=cond, cond_scale=cond_scale, ddim_steps=ddim_steps, ddim_eta=ddim_eta
+                shape,
+                cond=cond,
+                cond_scale=cond_scale,
+                ddim_steps=ddim_steps,
+                ddim_eta=ddim_eta,
+                spacing=ddim_spacing,
+                clip_x_start=ddim_clip_x_start,
+                clip_percentile=ddim_clip_percentile,
+                start_t=ddim_start_t,
+                seed=seed,
             )
         raise ValueError(f"unknown sampler {sampler!r}, expected 'ddpm' or 'ddim'")
 
@@ -1352,8 +1451,12 @@ class Trainer(object):
     preview_sampler = "ddpm"
     preview_ddim_steps = 50
     preview_ddim_eta = 0.0
+    preview_ddim_spacing = "uniform"
+    preview_ddim_clip_x_start = None
+    preview_ddim_clip_percentile = 0.995
 
-    def configure_preview_sampler(self, sampler="ddpm", ddim_steps=50, ddim_eta=0.0):
+    def configure_preview_sampler(self, sampler="ddpm", ddim_steps=50, ddim_eta=0.0,
+                                  spacing="uniform", clip_x_start=None, clip_percentile=0.995):
         """Choose the sampler used for training-time preview samples. Validates at
         startup rather than letting a bad value fail at the first sampling step,
         thousands of steps into a run."""
@@ -1362,9 +1465,14 @@ class Trainer(object):
         num_timesteps = getattr(self.model, "num_timesteps", None)
         if sampler == "ddim" and num_timesteps is not None and not 1 <= ddim_steps <= num_timesteps:
             raise ValueError(f"preview ddim_steps must be in [1, {num_timesteps}], got {ddim_steps}")
+        if spacing not in ("uniform", "logsnr"):
+            raise ValueError(f"unknown preview spacing {spacing!r}, expected 'uniform' or 'logsnr'")
         self.preview_sampler = sampler
         self.preview_ddim_steps = ddim_steps
         self.preview_ddim_eta = ddim_eta
+        self.preview_ddim_spacing = spacing
+        self.preview_ddim_clip_x_start = clip_x_start
+        self.preview_ddim_clip_percentile = clip_percentile
 
     def __init__(
         self,
@@ -1667,6 +1775,9 @@ class Trainer(object):
                     sampler=self.preview_sampler,
                     ddim_steps=self.preview_ddim_steps,
                     ddim_eta=self.preview_ddim_eta,
+                    ddim_spacing=self.preview_ddim_spacing,
+                    ddim_clip_x_start=self.preview_ddim_clip_x_start,
+                    ddim_clip_percentile=self.preview_ddim_clip_percentile,
                 )
 
             if self.use_wandb:
@@ -1693,6 +1804,11 @@ class Trainer(object):
         sampler="ddpm",
         ddim_steps=50,
         ddim_eta=0.0,
+        ddim_spacing="uniform",
+        ddim_clip_x_start=None,
+        ddim_clip_percentile=0.995,
+        ddim_start_t=None,
+        seed=None,
     ):
         # Number of samples to generate
         # cond video shape [num_samples, 1, F, H, W]
@@ -1705,6 +1821,11 @@ class Trainer(object):
             sampler=sampler,
             ddim_steps=ddim_steps,
             ddim_eta=ddim_eta,
+            ddim_spacing=ddim_spacing,
+            ddim_clip_x_start=ddim_clip_x_start,
+            ddim_clip_percentile=ddim_clip_percentile,
+            ddim_start_t=ddim_start_t,
+            seed=seed,
         )
         sampled_videos = sampled_videos.cpu().numpy() # [num_samples, 2, F, H, W]
         sampled_videos = np.expand_dims(sampled_videos, axis=1) # [num_samples, 1, 2, F, H, W]
@@ -1758,6 +1879,11 @@ class Trainer(object):
         sampler="ddpm",
         ddim_steps=50,
         ddim_eta=0.0,
+        ddim_spacing="uniform",
+        ddim_clip_x_start=None,
+        ddim_clip_percentile=0.995,
+        ddim_start_t=None,
+        seed=None,
     ):
         # Number of samples to generate
         # cond video shape [num_samples, 1, F, H, W]
@@ -1770,6 +1896,11 @@ class Trainer(object):
             sampler=sampler,
             ddim_steps=ddim_steps,
             ddim_eta=ddim_eta,
+            ddim_spacing=ddim_spacing,
+            ddim_clip_x_start=ddim_clip_x_start,
+            ddim_clip_percentile=ddim_clip_percentile,
+            ddim_start_t=ddim_start_t,
+            seed=seed,
         )
         sampled_videos = sampled_videos.cpu().numpy() # [num_samples, 2, F, H, W]
         sampled_videos = np.expand_dims(sampled_videos, axis=1) # [num_samples, 1, 2, F, H, W]

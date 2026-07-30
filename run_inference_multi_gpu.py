@@ -69,6 +69,16 @@ def parse_args():
                         help="override ddim_steps for every worker; ignored unless the sampler is ddim")
     parser.add_argument("--ddim_eta", type=float, default=None,
                         help="override ddim_eta for every worker; ignored unless the sampler is ddim")
+    parser.add_argument("--ddim_spacing", type=str, default=None, choices=["uniform", "logsnr"],
+                        help="override the DDIM timestep spacing for every worker")
+    parser.add_argument("--ddim_clip_x_start", type=str, default=None,
+                        help="override x0 clipping for every worker: 'none', 'dynamic', or a float")
+    parser.add_argument("--ddim_clip_percentile", type=float, default=None,
+                        help="override the dynamic-clip percentile for every worker")
+    parser.add_argument("--ddim_start_t", type=int, default=None,
+                        help="override the DDIM start timestep for every worker")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="seed x_T identically on every worker (each still gets its own videos)")
     parser.add_argument("--start", type=int, default=None,
                         help="only shard the [start:end) window of the file list (default: whole list)")
     parser.add_argument("--end", type=int, default=None,
@@ -199,6 +209,16 @@ def main():
             cmd += ["--ddim_steps", str(args.ddim_steps)]
         if args.ddim_eta is not None:
             cmd += ["--ddim_eta", str(args.ddim_eta)]
+        if args.ddim_spacing is not None:
+            cmd += ["--ddim_spacing", args.ddim_spacing]
+        if args.ddim_clip_x_start is not None:
+            cmd += ["--ddim_clip_x_start", args.ddim_clip_x_start]
+        if args.ddim_clip_percentile is not None:
+            cmd += ["--ddim_clip_percentile", str(args.ddim_clip_percentile)]
+        if args.ddim_start_t is not None:
+            cmd += ["--ddim_start_t", str(args.ddim_start_t)]
+        if args.seed is not None:
+            cmd += ["--seed", str(args.seed)]
         # Every worker calls save_config_snapshot on the SAME ./{experiment}/config.json.
         # Concurrently that races (one renames it to a backup, the rest hit
         # FileNotFoundError). Let only the first worker write it; the rest skip.

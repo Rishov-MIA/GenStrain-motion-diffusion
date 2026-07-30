@@ -62,6 +62,19 @@ def parse_args():
                         help='number of DDIM steps; ignored unless --sampler ddim')
     parser.add_argument('--ddim_eta', type=float, default=None,
                         help='DDIM stochasticity, 0.0 = deterministic; ignored unless --sampler ddim')
+    parser.add_argument('--ddim_spacing', type=str, default=None, choices=['uniform', 'logsnr'],
+                        help="how DDIM picks its timestep subsequence: 'uniform' in t (default) or "
+                             "'logsnr', which spends steps where the noise level actually moves")
+    parser.add_argument('--ddim_clip_x_start', type=str, default=None,
+                        help="bound the predicted x0 each DDIM step: 'none' (default), 'dynamic' "
+                             "(per-sample percentile clip), or a float for a fixed [-v, v] clamp")
+    parser.add_argument('--ddim_clip_percentile', type=float, default=None,
+                        help='percentile for --ddim_clip_x_start dynamic (default 0.995)')
+    parser.add_argument('--ddim_start_t', type=int, default=None,
+                        help='start DDIM at this timestep instead of timesteps-1. t=999 has a ~64,000x '
+                             'x0 amplification vs ~642x at t=998, so 998 is a good value')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='seed the initial noise x_T so runs are comparable; omit for random')
     parser.add_argument('--no_config_snapshot', action='store_true',
                         help='skip writing the config snapshot (set by the multi-GPU launcher on all but one worker to avoid a concurrent-write race)')
     return parser.parse_args()
@@ -114,6 +127,18 @@ def main():
     sampler = args.sampler if args.sampler is not None else infer_cfg.get("sampler", "ddpm")
     ddim_steps = args.ddim_steps if args.ddim_steps is not None else infer_cfg.get("ddim_steps", 50)
     ddim_eta = args.ddim_eta if args.ddim_eta is not None else infer_cfg.get("ddim_eta", 0.0)
+    ddim_spacing = args.ddim_spacing if args.ddim_spacing is not None else infer_cfg.get("ddim_spacing", "uniform")
+    ddim_clip_percentile = (args.ddim_clip_percentile if args.ddim_clip_percentile is not None
+                            else infer_cfg.get("ddim_clip_percentile", 0.995))
+    seed = args.seed if args.seed is not None else infer_cfg.get("seed", None)
+    ddim_start_t = args.ddim_start_t if args.ddim_start_t is not None else infer_cfg.get("ddim_start_t", None)
+    # "none"/null -> no clipping; "dynamic" -> percentile clip; anything else -> a float bound.
+    ddim_clip_x_start = (args.ddim_clip_x_start if args.ddim_clip_x_start is not None
+                         else infer_cfg.get("ddim_clip_x_start", None))
+    if isinstance(ddim_clip_x_start, str) and ddim_clip_x_start.lower() in ("none", "null", ""):
+        ddim_clip_x_start = None
+    elif isinstance(ddim_clip_x_start, str) and ddim_clip_x_start != "dynamic":
+        ddim_clip_x_start = float(ddim_clip_x_start)
 
     if not args.no_config_snapshot:
         save_config_snapshot(cfg, cfg["experiment_name"])
@@ -173,12 +198,12 @@ def main():
         # Generate samples
         if video_type == "cine":
             reconstructed_disp = None
-            trainer.sample_and_save_one_video_at_a_time("final", motion_cond_video, cond_filename, reconstructed_disp, None, save_folder=custom_save_folder, sampler=sampler, ddim_steps=ddim_steps, ddim_eta=ddim_eta)
+            trainer.sample_and_save_one_video_at_a_time("final", motion_cond_video, cond_filename, reconstructed_disp, None, save_folder=custom_save_folder, sampler=sampler, ddim_steps=ddim_steps, ddim_eta=ddim_eta, ddim_spacing=ddim_spacing, ddim_clip_x_start=ddim_clip_x_start, ddim_clip_percentile=ddim_clip_percentile, ddim_start_t=ddim_start_t, seed=seed)
         elif video_type == "dense":
             gt_disp_dir = str(base_path / data_cfg["gt_disp_dense_subdir"])
             gt_disp = np.load(os.path.join(gt_disp_dir, cond_filename[0]))
             reconstructed_disp = None
-            trainer.sample_and_save_one_video_at_a_time("final", motion_cond_video, cond_filename, reconstructed_disp, gt_disp, save_folder=custom_save_folder, sampler=sampler, ddim_steps=ddim_steps, ddim_eta=ddim_eta)
+            trainer.sample_and_save_one_video_at_a_time("final", motion_cond_video, cond_filename, reconstructed_disp, gt_disp, save_folder=custom_save_folder, sampler=sampler, ddim_steps=ddim_steps, ddim_eta=ddim_eta, ddim_spacing=ddim_spacing, ddim_clip_x_start=ddim_clip_x_start, ddim_clip_percentile=ddim_clip_percentile, ddim_start_t=ddim_start_t, seed=seed)
 
 
 if __name__ == "__main__":

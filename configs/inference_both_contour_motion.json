@@ -46,6 +46,11 @@
         "end": null,
         "sampler": "ddpm",
         "ddim_steps": 50,
-        "ddim_eta": 0.0
+        "ddim_eta": 0.0,
+        "ddim_spacing": "uniform",
+        "ddim_clip_x_start": null,
+        "ddim_clip_percentile": 0.995,
+        "ddim_start_t": null,
+        "seed": null
     }
 }

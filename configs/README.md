@@ -203,22 +203,29 @@ In DDP only rank 0 writes.
 - `resume` — true = load the latest checkpoint (milestone -1) before
   training, falling back to a fresh start if none exists; false = always
   start from scratch.
-- `preview_sampler`, `preview_ddim_steps`, `preview_ddim_eta` — sampler for the
+- `preview_sampler`, `preview_ddim_steps`, `preview_ddim_eta`,
+  `preview_ddim_spacing`, `preview_ddim_clip_x_start`,
+  `preview_ddim_clip_percentile` — sampler for the
   **preview sample taken every `save_and_sample_every` steps**, independent of
   the `inference` block. Same meaning as the inference fields, and `ddpm` is the
   default here too. See [Preview sampling during training](#preview-sampling-during-training).
 
 ### Preview sampling during training
 Every `save_and_sample_every` steps the trainer saves a checkpoint and samples
-one preview video. Under `preview_sampler: "ddpm"` that preview costs a full
-`diffusion.timesteps` (1000) network calls, and it is **not free** — on a
-700k-step run with `save_and_sample_every: 300` that is ~2,333 previews x 1000
-steps = ~2.3M extra forward passes, on the order of 10% of training wall-clock.
-Under DDP it is worse than it looks: only rank 0 samples, so every other rank
-sits at the next collective until it finishes.
+one preview video. Under `preview_sampler: "ddpm"` that preview walks all
+`diffusion.timesteps` (1000) steps, and each step costs **two** network calls,
+not one: `sample_and_save*` defaults to `cond_scale=2.0`, and
+`forward_with_cond_scale` runs a conditional and a null pass whenever
+`cond_scale != 1` (classifier-free guidance).
+
+So the preview is **not free** — on a 700k-step run with
+`save_and_sample_every: 300` that is ~2,333 previews x 1000 steps x 2 passes =
+~4.7M extra forward passes, on the order of 20% of training wall-clock. Under
+DDP it is worse than it looks: only rank 0 samples, so every other rank sits at
+the next collective until it finishes.
 
 Setting `preview_sampler: "ddim"` with `preview_ddim_steps: 50` cuts that to
-~117k forward passes, recovering most of the overhead:
+~233k forward passes, recovering most of the overhead:
 
 ```json
 "training": {
@@ -423,6 +430,13 @@ a config snapshot to `./{experiment_name}/config.json`
 - `ddim_eta` — DDIM stochasticity when `sampler` is `ddim`. `0.0` (default) is
   the deterministic path; `1.0` reproduces the DDPM posterior noise level.
   Ignored under `ddpm`.
+- `ddim_spacing` — `uniform` (default, evenly spaced in t) or `logsnr` (evenly
+  spaced in log-SNR). See [Tuning DDIM](#tuning-ddim-when-a-low-step-count-looks-bad).
+- `ddim_clip_x_start` — `null` (default, no clipping), `"dynamic"`, or a float
+  bound. Bounds the predicted x0 each DDIM step.
+- `ddim_clip_percentile` — percentile for `"dynamic"` (default `0.995`).
+- `seed` — seeds the initial noise `x_T`; `null` (default) draws randomly. Needed
+  to compare step counts fairly.
 
 ### Choosing a sampler
 Both samplers run the **same trained weights** — DDIM needs no retraining and no
@@ -451,6 +465,50 @@ on a few videos before trusting it for a full split** — compare the saved
 `inference_disps/*.npy` against the `ddpm` output for the same conditions and
 pick the smallest step count whose displacement error is acceptable. 50 is a
 common starting point, not a validated default for this data.
+
+### Tuning DDIM when a low step count looks bad
+If `ddim_steps: 50` degrades but a large count (e.g. 400) is fine, the problem is
+usually **not** that the data needs many steps. It is that uniform-in-t striding
+is coarsest exactly where this schedule curves hardest.
+
+`cosine_beta_schedule` clips betas at `0.9999`, so `alphas_cumprod` drops ~10,000x
+between t=998 and t=999 — a log-SNR cliff at the very top of the chain. And
+`predict_start_from_noise` scales by `1/sqrt(alphas_cumprod[t])`, about **6.5e4 at
+t=999**, so a small eps error there becomes a huge x0 error. DDPM's posterior
+coefficients damp that; DDIM at `eta=0` does not, because the first step's x0 sets
+the entire trajectory. Measured worst single log-SNR jump:
+
+| spacing | `ddim_steps` | max jump | steps at t>=900 |
+| --- | --- | --- | --- |
+| `uniform` | 50 | 15.20 | 5 |
+| `uniform` | 400 | 11.41 | 40 |
+| `logsnr` | 50 | **9.21** | 15 |
+
+`logsnr` at 50 steps is better conditioned than `uniform` at 400 — which is the
+whole point of the knob. Two fields address this:
+
+- `ddim_spacing: "logsnr"` — spend steps where the noise level actually moves
+  instead of uniformly in t. Try this **first**; it costs nothing.
+- `ddim_clip_x_start: "dynamic"` — bound the predicted x0 each step, killing the
+  6.5e4x amplification. Per-sample percentile clip (`ddim_clip_percentile`,
+  default `0.995`) with **no** rescale, since the Imagen-style `clamp(-s,s)/s`
+  assumes [-1,1] data and these fields are normalized by /5. A float instead of
+  `"dynamic"` clamps to a fixed `[-v, v]`.
+
+Also sweep `cond_scale`. Guidance overshoot is self-correcting under stochastic
+sampling and accumulates under deterministic few-step sampling, so a value tuned
+at 1000 DDPM steps is often too strong for 50-step DDIM.
+
+Set `seed` to compare fairly: without it every run draws a different `x_T`, so a
+50-vs-400 difference is confounded by the noise draw. With a seed, DDIM at
+`ddim_eta: 0.0` is fully reproducible. (For `ddpm` or `ddim_eta > 0` the seed
+fixes `x_T` only — the per-step noise stays stochastic.)
+
+```bash
+# recommended first attempt at a low step count
+python inference_full_region.py --sampler ddim --ddim_steps 50 \
+    --ddim_spacing logsnr --ddim_clip_x_start dynamic --seed 0
+```
 
 ### inference `data` subdir keys
 The inference configs reuse the training `data` keys and add a few for the

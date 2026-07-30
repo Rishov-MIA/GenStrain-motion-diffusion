@@ -472,6 +472,9 @@ class InverseFrequencyDDPTrainer(InverseFrequencyTrainer):
                         sampler=self.preview_sampler,
                         ddim_steps=self.preview_ddim_steps,
                         ddim_eta=self.preview_ddim_eta,
+                        ddim_spacing=self.preview_ddim_spacing,
+                        ddim_clip_x_start=self.preview_ddim_clip_x_start,
+                        ddim_clip_percentile=self.preview_ddim_clip_percentile,
                     )
 
             if self.use_wandb:

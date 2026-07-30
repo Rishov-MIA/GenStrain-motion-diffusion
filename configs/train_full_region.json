@@ -36,6 +36,9 @@
         "preview_sampler": "ddpm",
         "preview_ddim_steps": 50,
         "preview_ddim_eta": 0.0,
+        "preview_ddim_spacing": "uniform",
+        "preview_ddim_clip_x_start": null,
+        "preview_ddim_clip_percentile": 0.995,
         "resume": true
     },
     "logging": {
