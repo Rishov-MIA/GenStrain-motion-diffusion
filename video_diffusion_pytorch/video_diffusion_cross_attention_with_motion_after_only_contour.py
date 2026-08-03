@@ -13,7 +13,18 @@ from torch.utils import data
 from pathlib import Path
 from torch.optim import Adam
 from torchvision import transforms as T, utils
-from torch.cuda.amp import autocast, GradScaler
+# AMP: prefer the new torch.amp API (torch >= 2.3). Fall back to the deprecated
+# torch.cuda.amp on older torch so this file stays backward compatible.
+try:
+    from torch.amp import autocast as _autocast, GradScaler as _GradScaler
+
+    def autocast(enabled=True):
+        return _autocast("cuda", enabled=enabled)
+
+    def GradScaler(enabled=True):
+        return _GradScaler("cuda", enabled=enabled)
+except ImportError:  # torch < 2.3
+    from torch.cuda.amp import autocast, GradScaler
 from PIL import Image
 
 from tqdm import tqdm
@@ -22,12 +33,22 @@ from einops_exts import check_shape, rearrange_many
 
 from rotary_embedding_torch import RotaryEmbedding
 
+try:
+    import wandb
+except ImportError:  # wandb is optional; training works without it
+    wandb = None
+
 from video_diffusion_pytorch.utils import (
     generate_displacement_quiver_gifs,
     generate_mask_disp_side_by_side_gif,
     generate_displacement_quiver_gifs_with_gt,
     generate_displacement_quiver_gif_predicted_reconstructed_gt,
     generate_displacement_quiver_gif_comparison
+)
+from video_diffusion_pytorch.frame_validity import (
+    build_frame_mask,
+    load_valid_frames_map,
+    resolve_valid_frames,
 )
 
 # helpers functions
@@ -639,6 +660,29 @@ def extract(a, t, x_shape):
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
 
+def extract_noise_mask_from_first_frame(mask):
+    """
+    Extract a spatial noise mask from the FIRST FRAME of the binary mask.
+
+    Since displacement is always relative to the first frame, the noise region
+    is determined by frame 0 and broadcast across all frames.
+
+    Handles both 0-255 and 0-1 valued masks by binarizing with threshold 0.5.
+
+    Args:
+        mask: tensor of shape [B, 1, F, H, W] with values in [0, 1] or [0, 255]
+
+    Returns:
+        noise mask of shape [B, 1, F, H, W] (first frame repeated across all frames)
+    """
+    f = mask.shape[2]
+    first_frame = mask[:, :, 0, :, :]  # [B, 1, H, W]
+    # Binarize: handles both 0-255 (threshold > 0.5) and 0-1 ranges
+    first_frame = (first_frame > 0.5).float()
+    # Broadcast across all frames: [B, 1, F, H, W]
+    return first_frame.unsqueeze(2).expand(-1, -1, f, -1, -1)
+
+
 def cosine_beta_schedule(timesteps, s=0.008):
     """
     cosine schedule
@@ -667,12 +711,14 @@ class GaussianDiffusion(nn.Module):
         dynamic_thres_percentile=0.9,
         global_means=None,
         global_stds=None,
+        contour_noise_only=False,
     ):
         super().__init__()
         self.channels = channels
         self.image_size = image_size
         self.num_frames = num_frames
         self.denoise_fn = denoise_fn
+        self.contour_noise_only = contour_noise_only
 
         betas = cosine_beta_schedule(timesteps)
 
@@ -788,33 +834,202 @@ class GaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance
 
     @torch.inference_mode()
-    def p_sample(self, x, t, cond=None, cond_scale=1.0, clip_denoised=True):
+    def p_sample(self, x, t, cond=None, cond_scale=1.0, clip_denoised=True, noise_mask=None):
         b, *_, device = *x.shape, x.device
         model_mean, _, model_log_variance = self.p_mean_variance(
             x=x, t=t, clip_denoised=clip_denoised, cond=cond, cond_scale=cond_scale
         )
         noise = torch.randn_like(x)
 
+        # Mask stochastic noise to contour region only
+        if noise_mask is not None:
+            noise = noise * noise_mask
+
         # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
-        return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
+        result = model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
+
+        # Zero out non-contour pixels to prevent unconstrained predictions from accumulating
+        if noise_mask is not None:
+            result = result * noise_mask
+
+        return result
 
     @torch.inference_mode()
-    def p_sample_loop(self, shape, cond=None, cond_scale=1.0):
+    def p_sample_loop(self, shape, cond=None, cond_scale=1.0, seed=None):
         device = self.betas.device
 
         b = shape[0]
-        img = torch.randn(shape, device=device)
+        # seed=None keeps the original unseeded draw. A seed fixes x_T so two runs
+        # differ only by the sampler settings — required to compare step counts.
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=device).manual_seed(int(seed))
+        img = torch.randn(shape, device=device, generator=generator)
+
+        # When contour_noise_only, compute noise mask and apply to initial noise
+        noise_mask = None
+        if self.contour_noise_only and cond is not None and isinstance(cond[0], torch.Tensor):
+            noise_mask = extract_noise_mask_from_first_frame(cond[0])  # [B, 1, F, H, W]
+            img = img * noise_mask  # start with noise only in contour region
 
         for i in tqdm(reversed(range(0, self.num_timesteps)), desc="sampling loop time step", total=self.num_timesteps):
             img = self.p_sample(
-                img, torch.full((b,), i, device=device, dtype=torch.long), cond=[cond[0]], cond_scale=cond_scale # only contour
+                img, torch.full((b,), i, device=device, dtype=torch.long), cond=[cond[0]], cond_scale=cond_scale, noise_mask=noise_mask
             )
 
         return unnormalize_divide_by_5(img)
 
+    def ddim_timestep_pairs(self, ddim_steps, spacing="uniform", start_t=None):
+        """(t, t_prev) pairs for a DDIM subsequence of the full training chain,
+        walked from noisiest to cleanest. The last pair ends at -1, which stands
+        for alphas_cumprod_prev = 1 (i.e. fully denoised).
+
+        spacing:
+          "uniform" — evenly spaced in t (the DDIM paper's default).
+          "logsnr"  — evenly spaced in log-SNR. The cosine schedule packs an
+                      enormous log-SNR range into the top of the chain, so
+                      uniform-in-t strides are coarsest exactly where the
+                      trajectory curves most. This spends steps where the noise
+                      level actually moves, which is usually what lets a coarse
+                      step count work.
+        """
+        # start_t skips the top of the chain. `cosine_beta_schedule` clips betas at
+        # 0.9999, so beta[T-1] is ~0.9999 and alphas_cumprod falls ~10,000x in that
+        # single step; predict_start_from_noise then scales x0 by 1/sqrt(a_cumprod),
+        # i.e. ~64,000x at t=999 versus ~642x at t=998. DDPM's posterior damps that
+        # garbage x0; DDIM does not, and NO step count avoids the hop -- even 1000
+        # steps takes 999->998. Starting one step lower drops the amplification
+        # ~100x. It is a safe initialisation: alphas_cumprod[998] ~ 2.4e-6, so the
+        # true x_998 is pure noise to within ~0.15%, which is what we seed anyway.
+        start_t = self.num_timesteps - 1 if start_t is None else int(start_t)
+        if not 0 <= start_t <= self.num_timesteps - 1:
+            raise ValueError(f"ddim_start_t must be in [0, {self.num_timesteps - 1}], got {start_t}")
+
+        # Guard the silent failure: ddim_steps <= 0 yields an empty pair list, so
+        # the sample loop would return the initial noise as if it had denoised it.
+        if not 1 <= ddim_steps <= start_t + 1:
+            raise ValueError(f"ddim_steps must be in [1, {start_t + 1}] for start_t={start_t}, got {ddim_steps}")
+
+        if spacing == "uniform":
+            times = torch.linspace(-1, start_t, steps=ddim_steps + 1)
+            times = list(reversed(times.long().tolist()))
+        elif spacing == "logsnr":
+            # log-SNR is strictly decreasing in t, so walking targets from the
+            # noisiest end gives timesteps in descending order.
+            log_snr = (self.alphas_cumprod / (1.0 - self.alphas_cumprod)).log()
+            targets = torch.linspace(
+                log_snr[start_t].item(), log_snr[0].item(), steps=ddim_steps
+            )
+            times = []
+            for target in targets.tolist():
+                t = int((log_snr - target).abs().argmin().item())
+                # argmin can repeat once ddim_steps approaches num_timesteps; keep
+                # the sequence strictly descending rather than stalling on a t.
+                if not times or t < times[-1]:
+                    times.append(t)
+            times.append(-1)
+        else:
+            raise ValueError(f"unknown ddim spacing {spacing!r}, expected 'uniform' or 'logsnr'")
+
+        return list(zip(times[:-1], times[1:]))
+
+    def clip_x_start(self, x_start, mode=None, percentile=0.995):
+        """Bound the predicted x0 during DDIM sampling.
+
+        `predict_start_from_noise` scales by ~1/sqrt(alphas_cumprod[t]), which is
+        ~6.5e4 at t=999 under the cosine schedule, so a small eps error becomes an
+        enormous x0 error near the top of the chain. DDPM's posterior coefficients
+        damp that; DDIM at eta=0 does not — the first step's x0 sets the whole
+        trajectory. Bounding x0 is what keeps coarse strides stable.
+
+        mode:
+          None        — no clipping (the original behaviour).
+          "dynamic"   — per-sample percentile clamp of |x0|, with NO rescale. The
+                        Imagen-style `clamp(-s, s) / s` assumes [-1, 1] data;
+                        these displacement fields are normalized by /5, so the
+                        rescale would change their scale. This is a pure
+                        outlier clip and is scale-agnostic.
+          float       — clamp to [-value, value] in normalized units.
+        """
+        if mode is None:
+            return x_start
+
+        if mode == "dynamic":
+            s = torch.quantile(
+                rearrange(x_start, "b ... -> b (...)").abs().float(), percentile, dim=-1
+            )
+            s = s.view(-1, *((1,) * (x_start.ndim - 1))).to(x_start.dtype)
+            return x_start.clamp(min=-s, max=s)
+
+        if isinstance(mode, str):
+            raise ValueError(f"unknown clip_x_start {mode!r}, expected None, 'dynamic' or a float")
+
+        bound = abs(float(mode))
+        return x_start.clamp(-bound, bound)
+
     @torch.inference_mode()
-    def sample(self, cond=None, cond_scale=1.0, batch_size=16):
+    def ddim_sample_loop(self, shape, cond=None, cond_scale=1.0, ddim_steps=50, ddim_eta=0.0,
+                         spacing="uniform", clip_x_start=None, clip_percentile=0.995,
+                         start_t=None, seed=None):
+        """DDIM sampler over a subsequence of the training chain. Uses the same
+        trained eps-prediction network as `p_sample_loop` with no retraining,
+        for `num_timesteps / ddim_steps` times fewer denoise_fn calls.
+        `ddim_eta=0` is the deterministic ODE path; `ddim_eta=1` recovers
+        DDPM-like posterior noise."""
+        device = self.betas.device
+
+        b = shape[0]
+        # seed=None keeps the original unseeded draw. A seed fixes x_T so two runs
+        # differ only by the sampler settings — required to compare step counts.
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=device).manual_seed(int(seed))
+        img = torch.randn(shape, device=device, generator=generator)
+
+        # When contour_noise_only, compute noise mask and apply to initial noise
+        noise_mask = None
+        if self.contour_noise_only and cond is not None and isinstance(cond[0], torch.Tensor):
+            noise_mask = extract_noise_mask_from_first_frame(cond[0])  # [B, 1, F, H, W]
+            img = img * noise_mask  # start with noise only in contour region
+
+        time_pairs = self.ddim_timestep_pairs(ddim_steps, spacing=spacing, start_t=start_t)
+
+        for time, time_prev in tqdm(time_pairs, desc="ddim sampling loop time step", total=len(time_pairs)):
+            t = torch.full((b,), time, device=device, dtype=torch.long)
+            pred_noise = self.denoise_fn.forward_with_cond_scale(img, t, cond=[cond[0]], cond_scale=cond_scale)
+
+            x_start = self.predict_start_from_noise(img, t=t, noise=pred_noise)
+            # Off by default, so this stays comparable with p_mean_variance (whose
+            # clamp is commented out). Turn it on when coarse strides misbehave.
+            x_start = self.clip_x_start(x_start, mode=clip_x_start, percentile=clip_percentile)
+
+            alpha = self.alphas_cumprod[time]
+            alpha_prev = self.alphas_cumprod[time_prev] if time_prev >= 0 else torch.ones_like(alpha)
+
+            sigma = ddim_eta * ((1 - alpha_prev) / (1 - alpha)).sqrt() * (1 - alpha / alpha_prev).sqrt()
+            dir_coef = (1 - alpha_prev - sigma**2).clamp(min=0.0).sqrt()
+
+            img = alpha_prev.sqrt() * x_start + dir_coef * pred_noise
+
+            # no noise on the final step (time_prev == -1), matching p_sample
+            if ddim_eta > 0 and time_prev >= 0:
+                noise = torch.randn(img.shape, device=img.device, dtype=img.dtype, generator=generator)
+                # Mask stochastic noise to contour region only
+                if noise_mask is not None:
+                    noise = noise * noise_mask
+                img = img + sigma * noise
+
+            # Zero out non-contour pixels to prevent unconstrained predictions from accumulating
+            if noise_mask is not None:
+                img = img * noise_mask
+
+        return unnormalize_divide_by_5(img)
+
+    @torch.inference_mode()
+    def sample(self, cond=None, cond_scale=1.0, batch_size=16, sampler="ddpm", ddim_steps=50,
+               ddim_eta=0.0, ddim_spacing="uniform", ddim_clip_x_start=None,
+               ddim_clip_percentile=0.995, ddim_start_t=None, seed=None):
         device = next(self.denoise_fn.parameters()).device
 
         if is_list_str(cond):
@@ -826,9 +1041,25 @@ class GaussianDiffusion(nn.Module):
         image_size = self.image_size
         channels = self.channels
         num_frames = self.num_frames
-        return self.p_sample_loop(
-            (batch_size, channels, num_frames, image_size, image_size), cond=[contour_cond_video], cond_scale=cond_scale
-        )
+        shape = (batch_size, channels, num_frames, image_size, image_size)
+        cond = [contour_cond_video]
+
+        if sampler == "ddpm":
+            return self.p_sample_loop(shape, cond=cond, cond_scale=cond_scale, seed=seed)
+        if sampler == "ddim":
+            return self.ddim_sample_loop(
+                shape,
+                cond=cond,
+                cond_scale=cond_scale,
+                ddim_steps=ddim_steps,
+                ddim_eta=ddim_eta,
+                spacing=ddim_spacing,
+                clip_x_start=ddim_clip_x_start,
+                clip_percentile=ddim_clip_percentile,
+                start_t=ddim_start_t,
+                seed=seed,
+            )
+        raise ValueError(f"unknown sampler {sampler!r}, expected 'ddpm' or 'ddim'")
 
     @torch.inference_mode()
     def interpolate(self, x1, x2, t=None, lam=0.5):
@@ -846,21 +1077,49 @@ class GaussianDiffusion(nn.Module):
 
         return img
 
-    def q_sample(self, x_start, t, noise=None):
+    def q_sample(self, x_start, t, noise=None, noise_mask=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
+
+        if noise_mask is not None:
+            noise = noise * noise_mask
 
         return (
             extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
             + extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, cond=None, noise=None, **kwargs):
+    def p_losses(self, x_start, t, cond=None, noise=None, valid_frames=None, per_sample=False, **kwargs):
         # cond: [contour_cond_video]
         b, c, f, h, w, device = *x_start.shape, x_start.device
         noise = default(noise, lambda: torch.randn_like(x_start))
 
+        # per_sample=False (the default) keeps the original batch-joint reduction
+        # byte-for-byte: every sum collapses the whole [B, C, F, H, W] tensor to a
+        # scalar. per_sample=True instead keeps the batch dim, returning [B] losses
+        # so a caller can weight each sample individually (see the inverse-frequency
+        # reweighting trainer). Both numerator and denominator go through `reduce`,
+        # so each branch's normalization — and its scale — is unchanged per sample.
+        reduce = (lambda z: z.flatten(1).sum(1)) if per_sample else (lambda z: z.sum())
+
+        # Optional per-sample valid-frame mask [B, 1, F, 1, 1]: 1 on the leading
+        # valid frames, 0 on padding. None (no CSV) => original, unmasked loss.
+        frame_mask = None
+        if valid_frames is not None:
+            frame_mask = build_frame_mask(valid_frames, f, device=device, dtype=x_start.dtype)
+
+        # When contour_noise_only is enabled, mask noise using first frame of condition mask
+        noise_mask = None
+        if self.contour_noise_only and cond is not None and isinstance(cond[0], torch.Tensor):
+            noise_mask = extract_noise_mask_from_first_frame(cond[0])  # [B, 1, F, H, W]
+            noise = noise * noise_mask  # broadcasts to [B, 2, F, H, W]
+
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        
+
+        # Zero out non-contour pixels in x_noisy so the model always sees zeros
+        # outside the contour — matching what it sees during inference
+        if noise_mask is not None:
+            x_noisy = x_noisy * noise_mask
+
         # add encoder here
         if is_list_str(cond):
             cond = bert_embed(tokenize(cond), return_cls_repr=self.text_use_bert_cls)  # (3, 768) => (B, embedding_size)
@@ -876,20 +1135,79 @@ class GaussianDiffusion(nn.Module):
         # forward x0 print from predicted noise x_recon
         x0 = self.predict_start_from_noise(x_noisy, t=t, noise=x_recon)
 
-        mse_disp = torch.mean((x_start - x0) ** 2)
-        print(f"MSE disp in training: {mse_disp}")
-
-        if self.loss_type == "l1":
-            loss = F.l1_loss(noise, x_recon)
-        elif self.loss_type == "l2":
-            loss = F.mse_loss(noise, x_recon)
+        # Reconstruction MSE between the ground-truth displacement field (x_start)
+        # and the model's predicted x0, in normalized space. This measures the
+        # actual displacement-prediction quality, distinct from `loss` (the
+        # noise-prediction objective the model is trained on).
+        if frame_mask is None:
+            if per_sample:
+                disp_recon_mse = ((x_start - x0) ** 2).flatten(1).mean(1)
+            else:
+                disp_recon_mse = torch.mean((x_start - x0) ** 2)
         else:
-            raise NotImplementedError()
+            disp_recon_mse = reduce((x_start - x0) ** 2 * frame_mask) / reduce(
+                frame_mask.expand_as(x_start)
+            ).clamp(min=1.0)
 
-        return loss, unnormalize_divide_by_5(x0), unnormalize_divide_by_5(x_start)
+        if self.contour_noise_only and noise_mask is not None:
+            # Compute loss only in the contour region
+            if frame_mask is None:
+                masked_noise = noise * noise_mask
+                masked_recon = x_recon * noise_mask
+                # NOTE: noise_mask is [B, 1, F, H, W] while the numerator is
+                # [B, C, F, H, W], so this loss is C x the true per-element mean.
+                # Preserved deliberately — "fixing" it would rescale the effective
+                # learning rate of every existing contour_noise_only run.
+                num_contour_pixels = reduce(noise_mask).clamp(min=1.0)
+                if self.loss_type == "l1":
+                    loss = reduce((masked_noise - masked_recon).abs()) / num_contour_pixels
+                elif self.loss_type == "l2":
+                    loss = reduce((masked_noise - masked_recon) ** 2) / num_contour_pixels
+                else:
+                    raise NotImplementedError()
+            else:
+                # ...and, when given, only inside the valid frames
+                region = noise_mask * frame_mask
+                num_contour_pixels = reduce(region).clamp(min=1.0)
+                diff = noise - x_recon
+                if self.loss_type == "l1":
+                    loss = reduce(diff.abs() * region) / num_contour_pixels
+                elif self.loss_type == "l2":
+                    loss = reduce((diff ** 2) * region) / num_contour_pixels
+                else:
+                    raise NotImplementedError()
+        else:
+            if frame_mask is None:
+                # Every sample has the same element count here, so the per-sample
+                # mean averaged over the batch equals the batch-joint mean exactly.
+                loss_reduction = "none" if per_sample else "mean"
+                if self.loss_type == "l1":
+                    loss = F.l1_loss(noise, x_recon, reduction=loss_reduction)
+                elif self.loss_type == "l2":
+                    loss = F.mse_loss(noise, x_recon, reduction=loss_reduction)
+                else:
+                    raise NotImplementedError()
+                if per_sample:
+                    loss = loss.flatten(1).mean(1)
+            else:
+                # Full-region loss, averaged over valid frames only
+                diff = noise - x_recon
+                if self.loss_type == "l1":
+                    per_element = diff.abs()
+                elif self.loss_type == "l2":
+                    per_element = diff ** 2
+                else:
+                    raise NotImplementedError()
+                denom = reduce(frame_mask.expand_as(per_element)).clamp(min=1.0)
+                loss = reduce(per_element * frame_mask) / denom
+
+        return loss, unnormalize_divide_by_5(x0), unnormalize_divide_by_5(x_start), disp_recon_mse
         
-    def forward(self, x, cond=None, *args, **kwargs):
+    def forward(self, x, cond=None, *args, valid_frames=None, per_sample=False, **kwargs):
         # cond type: [contour_cond_video]
+        # per_sample must be a NAMED parameter here, not left to **kwargs: kwargs is
+        # forwarded into self.denoise_fn (the UNet) inside p_losses, which would
+        # reject it.
         (
             b,
             device,
@@ -901,10 +1219,12 @@ class GaussianDiffusion(nn.Module):
         )
         check_shape(x, "b c f h w", c=self.channels, f=self.num_frames, h=img_size, w=img_size)
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
-        
+
         x = normalize_divide_by_5(x)
         contour_cond_video = normalize_cond_img(cond[0])
-        return self.p_losses(x, t, cond=[contour_cond_video], **kwargs)
+        return self.p_losses(
+            x, t, cond=[contour_cond_video], valid_frames=valid_frames, per_sample=per_sample, **kwargs
+        )
     
     
     @torch.inference_mode()
@@ -1030,12 +1350,17 @@ class Dataset(data.Dataset):
         horizontal_flip=False,
         force_num_frames=True,
         exts=["npy"],  # both video as .npy format
+        valid_frames_map=None,       # {filename: valid_frame_count}; empty => all frames valid
+        valid_frames_missing="full",  # behavior when a file is absent from the map
     ):
         super().__init__()
         self.input_video_folder = input_video_folder
         self.contour_condition_video_dir = contour_condition_video_dir
         self.image_size = image_size
         self.channels = channels
+        self.num_frames = num_frames
+        self.valid_frames_map = valid_frames_map or {}
+        self.valid_frames_missing = valid_frames_missing
 
         self.video_pairs = []
 
@@ -1078,11 +1403,18 @@ class Dataset(data.Dataset):
             # Retrieve from cache
             input_video_tensor, contour_condition_video_tensor = self.cache[index]
 
+        # Per-sample valid-frame count (leading-N valid); num_frames when the
+        # file isn't in the map or no CSV was given => an all-valid mask downstream.
+        valid_frames = resolve_valid_frames(
+            self.valid_frames_map, Path(input_video_path).name, self.num_frames, self.valid_frames_missing
+        )
+
         # Optionally, you can apply any transformations here (like resizing, normalization, etc.)
         # For now, return the tensors directly
         return (
             input_video_tensor.squeeze(0),  # Remove extra dimension
             contour_condition_video_tensor,
+            valid_frames,
         )
 
 def random_pick_condition_videos(num_samples, contour_cond_video_dir):
@@ -1111,6 +1443,37 @@ def random_pick_condition_videos(num_samples, contour_cond_video_dir):
 
 
 class Trainer(object):
+    # Sampler for the periodic preview samples taken every `save_and_sample_every`
+    # training steps. These are CLASS attributes rather than set in __init__ so
+    # that every Trainer subclass has them — including the DDP trainers, which
+    # deliberately skip super().__init__(). Named preview_* because `self.sampler`
+    # is already the DDP DistributedSampler.
+    preview_sampler = "ddpm"
+    preview_ddim_steps = 50
+    preview_ddim_eta = 0.0
+    preview_ddim_spacing = "uniform"
+    preview_ddim_clip_x_start = None
+    preview_ddim_clip_percentile = 0.995
+
+    def configure_preview_sampler(self, sampler="ddpm", ddim_steps=50, ddim_eta=0.0,
+                                  spacing="uniform", clip_x_start=None, clip_percentile=0.995):
+        """Choose the sampler used for training-time preview samples. Validates at
+        startup rather than letting a bad value fail at the first sampling step,
+        thousands of steps into a run."""
+        if sampler not in ("ddpm", "ddim"):
+            raise ValueError(f"unknown preview sampler {sampler!r}, expected 'ddpm' or 'ddim'")
+        num_timesteps = getattr(self.model, "num_timesteps", None)
+        if sampler == "ddim" and num_timesteps is not None and not 1 <= ddim_steps <= num_timesteps:
+            raise ValueError(f"preview ddim_steps must be in [1, {num_timesteps}], got {ddim_steps}")
+        if spacing not in ("uniform", "logsnr"):
+            raise ValueError(f"unknown preview spacing {spacing!r}, expected 'uniform' or 'logsnr'")
+        self.preview_sampler = sampler
+        self.preview_ddim_steps = ddim_steps
+        self.preview_ddim_eta = ddim_eta
+        self.preview_ddim_spacing = spacing
+        self.preview_ddim_clip_x_start = clip_x_start
+        self.preview_ddim_clip_percentile = clip_percentile
+
     def __init__(
         self,
         diffusion_model,
@@ -1131,6 +1494,13 @@ class Trainer(object):
         max_grad_norm=None,
         experiment_name="test-exp",
         inference_only=False,
+        use_wandb=False,
+        wandb_project="genstrain-motion-diffusion",
+        wandb_config=None,
+        valid_frames_csv=None,
+        valid_frames_filename_col="dense_filename",
+        valid_frames_count_col="dense_valid_frames",
+        valid_frames_missing="full",
     ):
         super().__init__()
         self.model = diffusion_model
@@ -1151,6 +1521,13 @@ class Trainer(object):
         channels = diffusion_model.channels
         num_frames = diffusion_model.num_frames
 
+        # Optional per-sample valid-frame masking. Empty map (no CSV) => masking
+        # off, i.e. the loss is byte-for-byte the original all-frames loss.
+        self.valid_frames_map = load_valid_frames_map(
+            valid_frames_csv, valid_frames_filename_col, valid_frames_count_col
+        )
+        self.use_frame_validity = bool(self.valid_frames_map)
+
         if not inference_only:
             self.ds = Dataset(
                 input_video_folder,
@@ -1158,7 +1535,12 @@ class Trainer(object):
                 contour_condition_video_dir,
                 channels=channels,
                 num_frames=num_frames,
+                valid_frames_map=self.valid_frames_map,
+                valid_frames_missing=valid_frames_missing,
             )
+
+            if self.use_frame_validity:
+                print(f"valid-frame loss masking ON ({len(self.valid_frames_map)} CSV entries)")
 
             print(f"found {len(self.ds)} videos as .npy files at {input_video_folder}")
             assert len(self.ds) > 0, "need to have at least 1 video to start training (although 1 is not great, try 100k)"
@@ -1173,6 +1555,45 @@ class Trainer(object):
         self.max_grad_norm = max_grad_norm
 
         self.experiment_name = experiment_name
+
+        # Optional Weights & Biases logging. Off by default so existing runs are
+        # unaffected; enable via the config (see configs/README.md).
+        self.use_wandb = use_wandb and not inference_only
+        if self.use_wandb:
+            assert wandb is not None, "use_wandb=True but wandb is not installed (pip install wandb)"
+            wandb.init(
+                project=wandb_project,
+                name=experiment_name,
+                config=wandb_config,
+                resume="allow",
+            )
+            # Plot the epoch metrics against epoch number (not step): each gets its
+            # own panel with `epoch` as the x-axis. Step-level metrics (loss,
+            # loss_cummean, disp_recon_mse) keep the default global-step axis.
+            wandb.define_metric("epoch")
+            wandb.define_metric("epoch_loss", step_metric="epoch")
+            wandb.define_metric("epoch_disp_recon_mse", step_metric="epoch")
+
+        # True cumulative mean-since-start of the training loss: running sum +
+        # count, so cumulative_mean = sum / count. Not checkpointed (restarts from
+        # zero on resume).
+        self._loss_sum = 0.0
+        self._loss_count = 0
+
+        # ---- epoch loss bookkeeping ----
+        # One epoch = the model has seen the whole dataset once. Every optimizer
+        # step consumes batch_size * gradient_accumulate_every samples, so:
+        if not inference_only:
+            samples_per_step = self.batch_size * self.gradient_accumulate_every
+            self.steps_per_epoch = max(1, len(self.ds) // samples_per_step)
+        else:
+            self.steps_per_epoch = None
+        # Running sums of the per-step loss and displacement-reconstruction MSE
+        # within the current epoch, plus how many steps have contributed. Reset at
+        # each epoch boundary. (Both share _epoch_step_count as the denominator.)
+        self._epoch_loss_sum = 0.0
+        self._epoch_disp_recon_mse_sum = 0.0
+        self._epoch_step_count = 0
 
         checkpoints_folder = f"./{self.experiment_name}/checkpoints"
         self.checkpoints_folder = Path(checkpoints_folder)
@@ -1206,7 +1627,14 @@ class Trainer(object):
             ), "need to have at least one milestone to load from latest checkpoint (milestone == -1)"
             milestone = max(all_milestones)
 
-        data = torch.load(str(self.checkpoints_folder / f"model-{milestone}.pt"))
+        # torch >= 2.6 flipped torch.load's default to weights_only=True, which
+        # rejects our checkpoint dicts; pass weights_only=False there. Older torch
+        # (< 2.0) doesn't accept that kwarg, so fall back to the plain call.
+        ckpt_path = str(self.checkpoints_folder / f"model-{milestone}.pt")
+        try:
+            data = torch.load(ckpt_path, weights_only=False)
+        except TypeError:
+            data = torch.load(ckpt_path)
 
         print(f"loaded checkpoint: model-{milestone}.pt\n")
 
@@ -1218,25 +1646,84 @@ class Trainer(object):
     def train(self, prob_focus_present=0.0, focus_present_mask=None, log_fn=noop):
         assert callable(log_fn)
 
+        # Horizontal progress bar for the current epoch. It fills as steps within
+        # the epoch complete and resets at each epoch boundary. The bar's fill and
+        # the epoch-loss average share one counter (self._epoch_step_count), so they
+        # always reset together. On a resume both start at 0 and the bar restarts
+        # the current epoch from the beginning (the loss of earlier steps in that
+        # epoch is unrecoverable anyway); the epoch NUMBER still reflects the
+        # restored step so labels stay correct.
+        current_epoch = self.step // self.steps_per_epoch
+        self._epoch_loss_sum = 0.0
+        self._epoch_disp_recon_mse_sum = 0.0
+        self._epoch_step_count = 0
+        epoch_bar = tqdm(
+            total=self.steps_per_epoch,
+            desc=f"epoch {current_epoch}",
+            unit="step",
+            leave=True,
+            dynamic_ncols=True,
+        )
+
         while self.step < self.train_num_steps:
             for i in range(self.gradient_accumulate_every):
-                input_video, contour_cond_video = next(self.dl)
+                input_video, contour_cond_video, valid_frames = next(self.dl)
                 input_video = input_video.cuda()
                 contour_cond_video = contour_cond_video.cuda()
+                valid_frames = valid_frames.cuda() if self.use_frame_validity else None
 
                 with autocast(enabled=self.amp):
-                    loss, x0, x_start = self.model(
+                    loss, x0, x_start, disp_recon_mse = self.model(
                         input_video,
                         cond=[contour_cond_video],
+                        valid_frames=valid_frames,
                         prob_focus_present=prob_focus_present,
                         focus_present_mask=focus_present_mask,
                     )
 
                     self.scaler.scale(loss / self.gradient_accumulate_every).backward()
 
-                print(f"{self.step}: {loss.item()}")
+                # Route through the bar's writer so per-step loss lines scroll above
+                # the pinned epoch progress bar instead of fighting it.
+                epoch_bar.write(
+                    f"{self.step}: {loss.item()} | disp_recon_mse: {disp_recon_mse.item()}"
+                )
 
-            log = {"loss": loss.item()}
+            # Accumulate the true cumulative mean of the loss since the start.
+            self._loss_sum += loss.item()
+            self._loss_count += 1
+
+            log = {
+                "loss": loss.item(),
+                "loss_cummean": self._loss_sum / self._loss_count,
+                "disp_recon_mse": disp_recon_mse.item(),
+                "step": self.step,
+            }
+
+            # Accumulate the epoch loss / disp_recon_mse and advance the epoch bar.
+            # When the current step completes a full pass over the dataset, emit the
+            # means, then reset the bar and counters for the next epoch.
+            self._epoch_loss_sum += loss.item()
+            self._epoch_disp_recon_mse_sum += disp_recon_mse.item()
+            self._epoch_step_count += 1
+            epoch_bar.update(1)
+            epoch_bar.set_postfix(loss=loss.item())
+            if self._epoch_step_count >= self.steps_per_epoch:
+                epoch_loss = self._epoch_loss_sum / self._epoch_step_count
+                epoch_disp_recon_mse = self._epoch_disp_recon_mse_sum / self._epoch_step_count
+                epoch = (self.step + 1) // self.steps_per_epoch
+                epoch_bar.write(
+                    f"  epoch {epoch} | epoch_loss {epoch_loss} | "
+                    f"epoch_disp_recon_mse {epoch_disp_recon_mse}"
+                )
+                log["epoch"] = epoch
+                log["epoch_loss"] = epoch_loss
+                log["epoch_disp_recon_mse"] = epoch_disp_recon_mse
+                epoch_bar.reset()
+                epoch_bar.set_description(f"epoch {epoch + 1}")
+                self._epoch_loss_sum = 0.0
+                self._epoch_disp_recon_mse_sum = 0.0
+                self._epoch_step_count = 0
 
             if exists(self.max_grad_norm):
                 self.scaler.unscale_(self.opt)
@@ -1250,19 +1737,19 @@ class Trainer(object):
                 self.step_ema()
 
             # Save recontructed x0 every 300 steps (customize as needed)
-            if (self.step % 300 == 0) and (self.step != 0):
-                predicted_start_training_dir = f"./{self.experiment_name}/predicted_start_training_gifs"
-                os.makedirs(predicted_start_training_dir, exist_ok=True)
-                x0 = x0.detach().cpu().numpy()
-                x_start = x_start.detach().cpu().numpy()
+            # if (self.step % 300 == 0) and (self.step != 0):
+            #     predicted_start_training_dir = f"./{self.experiment_name}/predicted_start_training_gifs"
+            #     os.makedirs(predicted_start_training_dir, exist_ok=True)
+            #     x0 = x0.detach().cpu().numpy()
+            #     x_start = x_start.detach().cpu().numpy()
 
-                generate_displacement_quiver_gifs_with_gt(
-                    milestone="train",
-                    filenames=[f"train_visual_{self.step}"],
-                    pred_disp=np.expand_dims(x0[0:1], axis=0),
-                    gt_disp=np.expand_dims(x_start[0:1], axis=0),
-                    output_dir=predicted_start_training_dir,
-                )
+            #     generate_displacement_quiver_gifs_with_gt(
+            #         milestone="train",
+            #         filenames=[f"train_visual_{self.step}"],
+            #         pred_disp=np.expand_dims(x0[0:1], axis=0),
+            #         gt_disp=np.expand_dims(x_start[0:1], axis=0),
+            #         output_dir=predicted_start_training_dir,
+            #     )
 
             if self.step != 0 and self.step % self.save_and_sample_every == 0:
                 milestone = self.step // self.save_and_sample_every
@@ -1285,10 +1772,24 @@ class Trainer(object):
                     contour_cond_video=sample_contour_cond,
                     cond_filenames=sample_cond_filenames,
                     save_folder=f"./{self.experiment_name}/sampled_videos_infos",
+                    sampler=self.preview_sampler,
+                    ddim_steps=self.preview_ddim_steps,
+                    ddim_eta=self.preview_ddim_eta,
+                    ddim_spacing=self.preview_ddim_spacing,
+                    ddim_clip_x_start=self.preview_ddim_clip_x_start,
+                    ddim_clip_percentile=self.preview_ddim_clip_percentile,
                 )
+
+            if self.use_wandb:
+                wandb.log(log, step=self.step)
 
             log_fn(log)
             self.step += 1
+
+        epoch_bar.close()
+
+        if self.use_wandb:
+            wandb.finish()
 
         print("training completed")
 
@@ -1300,12 +1801,32 @@ class Trainer(object):
         cond_filenames=None,
         cond_scale=2.0,
         save_folder="./sampled_videos_infos",
+        sampler="ddpm",
+        ddim_steps=50,
+        ddim_eta=0.0,
+        ddim_spacing="uniform",
+        ddim_clip_x_start=None,
+        ddim_clip_percentile=0.995,
+        ddim_start_t=None,
+        seed=None,
     ):
         # Number of samples to generate
         # cond video shape [num_samples, 1, F, H, W]
         num_samples = contour_cond_video.shape[0]
 
-        sampled_videos = self.ema_model.sample(cond=[contour_cond_video], cond_scale=cond_scale, batch_size=num_samples)
+        sampled_videos = self.ema_model.sample(
+            cond=[contour_cond_video],
+            cond_scale=cond_scale,
+            batch_size=num_samples,
+            sampler=sampler,
+            ddim_steps=ddim_steps,
+            ddim_eta=ddim_eta,
+            ddim_spacing=ddim_spacing,
+            ddim_clip_x_start=ddim_clip_x_start,
+            ddim_clip_percentile=ddim_clip_percentile,
+            ddim_start_t=ddim_start_t,
+            seed=seed,
+        )
         sampled_videos = sampled_videos.cpu().numpy() # [num_samples, 2, F, H, W]
         sampled_videos = np.expand_dims(sampled_videos, axis=1) # [num_samples, 1, 2, F, H, W]
         # to unnormalize it multiply with 255.0
@@ -1355,12 +1876,32 @@ class Trainer(object):
         gt_disp=None,
         cond_scale=2.0,
         save_folder="./sampled_videos_infos",
+        sampler="ddpm",
+        ddim_steps=50,
+        ddim_eta=0.0,
+        ddim_spacing="uniform",
+        ddim_clip_x_start=None,
+        ddim_clip_percentile=0.995,
+        ddim_start_t=None,
+        seed=None,
     ):
         # Number of samples to generate
         # cond video shape [num_samples, 1, F, H, W]
         num_samples = contour_cond_video.shape[0]
 
-        sampled_videos = self.ema_model.sample(cond=[contour_cond_video], cond_scale=cond_scale, batch_size=num_samples)
+        sampled_videos = self.ema_model.sample(
+            cond=[contour_cond_video],
+            cond_scale=cond_scale,
+            batch_size=num_samples,
+            sampler=sampler,
+            ddim_steps=ddim_steps,
+            ddim_eta=ddim_eta,
+            ddim_spacing=ddim_spacing,
+            ddim_clip_x_start=ddim_clip_x_start,
+            ddim_clip_percentile=ddim_clip_percentile,
+            ddim_start_t=ddim_start_t,
+            seed=seed,
+        )
         sampled_videos = sampled_videos.cpu().numpy() # [num_samples, 2, F, H, W]
         sampled_videos = np.expand_dims(sampled_videos, axis=1) # [num_samples, 1, 2, F, H, W]
         # to unnormalize it multiply with 255.0

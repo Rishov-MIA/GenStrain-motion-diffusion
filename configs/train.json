@@ -1,0 +1,54 @@
+{
+    "experiment_name": "new-data-noise-contour-region-cond-mask-only",
+    "data": {
+        "base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames",
+        "input_video_subdir": "dense/train/displacement_dense",
+        "contour_condition_subdir": "dense/train/dense_mask",
+        "sampling_contour_condition_subdir": "dense/test/dense_mask"
+    },
+    "model": {
+        "dim": 48,
+        "cond_dim": null,
+        "channels": 2,
+        "dim_mults": [
+            1,
+            2,
+            4,
+            8
+        ]
+    },
+    "diffusion": {
+        "image_size": 64,
+        "num_frames": 26,
+        "channels": 2,
+        "timesteps": 1000,
+        "loss_type": "l2",
+        "contour_noise_only": true
+    },
+    "training": {
+        "batch_size": 16,
+        "lr": 1e-05,
+        "num_steps": 700000,
+        "gradient_accumulate_every": 1,
+        "ema_decay": 0.995,
+        "amp": true,
+        "save_and_sample_every": 300,
+        "preview_sampler": "ddpm",
+        "preview_ddim_steps": 50,
+        "preview_ddim_eta": 0.0,
+        "preview_ddim_spacing": "uniform",
+        "preview_ddim_clip_x_start": null,
+        "preview_ddim_clip_percentile": 0.995,
+        "resume": true
+    },
+    "logging": {
+        "use_wandb": false,
+        "wandb_project": "genstrain-motion-diffusion"
+    },
+    "frame_validity": {
+        "csv_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames/frame_counts_train.csv",
+        "filename_col": "dense_filename",
+        "valid_frames_col": "dense_valid_frames",
+        "missing": "error"
+    }
+}

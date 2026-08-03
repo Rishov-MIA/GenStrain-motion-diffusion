@@ -12,12 +12,14 @@ __pycache__/
 *.png
 *.pth
 *.mat
-*.json
 *.zip
 MR*
 *.csv
 *.xls
 *.xlsx
+*.slurm
+config*.json
+*.env
 
 # Distribution / packaging
 .Python
@@ -116,6 +118,9 @@ celerybeat.pid
 
 # Environments
 .env
+wandb.env
+# wandb local run logs / offline-mode data
+wandb/
 .venv
 env/
 venv/
