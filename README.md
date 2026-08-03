@@ -41,49 +41,129 @@ Expected layout (adapt as needed):
 Notes:
 
 - The dataset uses `.npy` files only and matches them one-to-one by sorted filename order. **All files of** `b` **,** `cine_mask` **and** `displacement_dense` **should have the same filenames.**
-- `dense_mask` or `cine_mask` directory `.npy `files are expected to be shaped `[1, F, H, W]` where `F=20`, `H=48`, `W=48`
+- `dense_mask` or `cine_mask` directory `.npy `files are expected to be shaped `[1, F, H, W]`, where `F` and `H`/`W` must equal the `num_frames` and `image_size` set in your config. The shipped configs use `F=26`, `H=64`, `W=64`.
 - **Mask videos are binary with values 0 and 255.0**; traininng and inference normalizes them to 0–1 by dividing by 255.0.
 - `displacement_dense` directory  `.npy` files should contain displacement fields shaped `[1, 2, F, H, W]`.
 
 ## Training
 
-1) Edit the dataset base path and experiment name in `train.py`:
+Hyperparameters are **not** edited in `train.py` — they live in a JSON config, `configs/train.json` by default.
 
-```python
-base_path = "/path/to/data"
-exp_name = "my-experiment"
+1) Point the config at your data and name the experiment:
+
+```json
+{
+  "experiment_name": "my-experiment",
+  "data": {
+    "base_path": "/path/to/data",
+    "input_video_subdir": "dense/train/displacement_dense",
+    "contour_condition_subdir": "dense/train/dense_mask",
+    "sampling_contour_condition_subdir": "dense/test/dense_mask"
+  }
+}
 ```
 
-2) (Optional) Adjust model/training hyperparameters in `train.py`.
-3) Run training:
+2) Run:
 
 ```bash
-python train.py
+python train.py                                  # uses configs/train.json
+python train.py --config configs/my_run.json     # any other config
 ```
 
-Checkpoints are saved to `./<exp_name>/checkpoints/`.
+Checkpoints are saved to `./<experiment_name>/checkpoints/`. Every run also writes a timestamped copy of the config it ran with, so a finished experiment records its own settings.
+
+### Config blocks
+
+| Block | Purpose |
+| --- | --- |
+| `data` | `base_path` plus the four subdirectories under it |
+| `model` | `Unet3D`: `dim`, `cond_dim`, `channels`, `dim_mults` |
+| `diffusion` | `image_size`, `num_frames`, `channels`, `timesteps`, `loss_type`, `contour_noise_only` |
+| `training` | batch size, lr, step count, EMA, AMP, checkpoint interval, `resume`, preview-sampler knobs |
+| `logging` | optional Weights & Biases settings |
+| `frame_validity` | optional valid-frame loss masking |
+
+`image_size` and `num_frames` must match the actual shape of your `.npy` files — nothing resizes or resamples, and a mismatch asserts on the first step.
+
+`contour_noise_only: true` applies the diffusion noise only inside the contour region rather than over the whole frame.
 
 ### Resume training
 
-Uncomment this line in `train.py` to resume from the latest checkpoint:
+Set `"resume": true` in the `training` block. The latest checkpoint loads automatically on startup, and training starts from scratch if none exists — no code edit needed.
 
-```python
-trainer.load(milestone=-1)
+### Preview sampling during training
+
+Every `save_and_sample_every` steps the trainer samples a few preview videos. These default to full DDPM sampling; point them at DDIM to make the previews much cheaper:
+
+```json
+"preview_sampler": "ddim",
+"preview_ddim_steps": 50,
+"preview_ddim_eta": 0.0
 ```
+
+This affects previews only, never the training loss.
+
+### Valid-frame loss masking (optional)
+
+Clips resampled to a fixed `num_frames` may only have their first N frames real, the rest padding. Point `frame_validity` at a CSV listing the real count per video and the loss will ignore the padding:
+
+```json
+"frame_validity": {
+  "csv_path": "/path/to/frame_counts_train.csv",
+  "filename_col": "dense_filename",
+  "valid_frames_col": "dense_valid_frames",
+  "missing": "error"
+}
+```
+
+`valid_frames = N` means frames `[0:N]` are real and `[N:num_frames]` are padding. `missing` controls files absent from the CSV: `"full"` treats them as fully valid, `"error"` raises so you can guarantee full coverage. Omit the block entirely and the loss is byte-for-byte the original all-frames loss.
+
+### Weights & Biases (optional)
+
+```json
+"logging": { "use_wandb": true, "wandb_project": "genstrain-motion-diffusion" }
+```
+
+Off by default, and the `wandb` import is guarded — training runs fine without the package installed.
 
 ## Inference
 
-1) Edit `base_path` and `exp_name` in `inference.py` to match your data and trained experiment.
-2) Make sure checkpoints exist in `./<exp_name>/checkpoints/`.
-3) Run inference:
+Settings live in `configs/inference.json` by default. Requires a CUDA GPU.
 
 ```bash
-python inference.py --video_type cine
+python inference.py                                    # uses configs/inference.json
+python inference.py --config configs/my_inference.json
+python inference.py --video_type dense --start 0 --end 50
 ```
 
-Arguments:
+The config's `inference` block supplies defaults; any flag passed on the CLI overrides it for that run.
 
-- `--video_type`: `cine`, `dense`, `paired_cine`, `paired_dense`
-- `--start`, `--end`: index range for videos in the contour/mask folder (optional)
+| Flag / config key | Meaning |
+| --- | --- |
+| `--video_type` | `cine` or `dense`. `dense` also loads ground-truth displacements for comparison |
+| `--start`, `--end` | index range into the sorted contour/mask folder |
+| `--milestone` | checkpoint to load; `-1` is the latest |
+| `--sampler` | `ddpm` (default) or `ddim` |
+| `--ddim_steps` | DDIM step count |
+| `--ddim_eta` | DDIM stochasticity; `0.0` is deterministic |
+| `--ddim_spacing` | `uniform` in `t` (default), or `logsnr` to spend steps where the noise level actually moves |
+| `--ddim_clip_x_start` | bound the predicted x0 each step: `none` (default), `dynamic`, or a float for a fixed `[-v, v]` clamp |
+| `--ddim_clip_percentile` | percentile used by `dynamic` clipping (default `0.995`) |
+| `--ddim_start_t` | start below `timesteps-1`; `998` avoids the extreme x0 amplification at `t=999` |
+| `--seed` | seed the initial noise so runs are comparable |
 
-Outputs are saved to `./<exp_name>/sampling_time_sampled_<video_type>_part_videos_infos/` and the folder is created automatically. Update `custom_save_folder` in `inference.py` if you want a different location.
+The `ddim_*` flags are ignored unless `--sampler ddim`.
+
+The `model` and `diffusion` blocks must match the checkpoint you are loading — in particular `image_size` and `num_frames`, or the weights will not load.
+
+### Faster sampling with DDIM
+
+By default sampling walks all `timesteps` (1000) denoising steps. `ddim` walks a strided subsequence of the same chain, so one video costs `ddim_steps` network calls instead of 1000 — roughly a `1000 / ddim_steps` speedup. It reuses the **same trained checkpoint**; there is nothing to retrain.
+
+```bash
+python inference.py --video_type dense --sampler ddim --ddim_steps 50
+```
+
+DDPM remains the default so existing results are unchanged. Fewer steps trades fidelity for speed, so compare against the DDPM output on a few videos before running a whole split. If a low step count looks bad, try `--ddim_start_t 998`, then `--ddim_spacing logsnr`, then `--ddim_clip_x_start dynamic`.
+
+Outputs are saved to `./<experiment_name>/sampling_time_sampled_<video_type>_part_videos_infos/`, created automatically.
