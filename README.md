@@ -79,7 +79,7 @@ Checkpoints are saved to `./<experiment_name>/checkpoints/`. Every run also writ
 | `data` | `base_path` plus the four subdirectories under it |
 | `model` | `Unet3D`: `dim`, `cond_dim`, `channels`, `dim_mults` |
 | `diffusion` | `image_size`, `num_frames`, `channels`, `timesteps`, `loss_type`, `contour_noise_only` |
-| `training` | batch size, lr, step count, EMA, AMP, checkpoint interval, `resume`, preview-sampler knobs |
+| `training` | batch size, lr, step count, EMA, AMP, checkpoint interval, `resume` |
 | `logging` | optional Weights & Biases settings |
 | `frame_validity` | optional valid-frame loss masking |
 
@@ -93,15 +93,7 @@ Set `"resume": true` in the `training` block. The latest checkpoint loads automa
 
 ### Preview sampling during training
 
-Every `save_and_sample_every` steps the trainer samples a few preview videos. These default to full DDPM sampling; point them at DDIM to make the previews much cheaper:
-
-```json
-"preview_sampler": "ddim",
-"preview_ddim_steps": 50,
-"preview_ddim_eta": 0.0
-```
-
-This affects previews only, never the training loss.
+Every `save_and_sample_every` steps the trainer samples a few preview videos alongside the checkpoint, so you can watch quality progress without stopping the run. Previews use DDPM sampling and never affect the training loss.
 
 ### Valid-frame loss masking (optional)
 
@@ -143,27 +135,10 @@ The config's `inference` block supplies defaults; any flag passed on the CLI ove
 | `--video_type` | `cine` or `dense`. `dense` also loads ground-truth displacements for comparison |
 | `--start`, `--end` | index range into the sorted contour/mask folder |
 | `--milestone` | checkpoint to load; `-1` is the latest |
-| `--sampler` | `ddpm` (default) or `ddim` |
-| `--ddim_steps` | DDIM step count |
-| `--ddim_eta` | DDIM stochasticity; `0.0` is deterministic |
-| `--ddim_spacing` | `uniform` in `t` (default), or `logsnr` to spend steps where the noise level actually moves |
-| `--ddim_clip_x_start` | bound the predicted x0 each step: `none` (default), `dynamic`, or a float for a fixed `[-v, v]` clamp |
-| `--ddim_clip_percentile` | percentile used by `dynamic` clipping (default `0.995`) |
-| `--ddim_start_t` | start below `timesteps-1`; `998` avoids the extreme x0 amplification at `t=999` |
 | `--seed` | seed the initial noise so runs are comparable |
 
-The `ddim_*` flags are ignored unless `--sampler ddim`.
+Sampling uses DDPM, walking all `timesteps` (1000) denoising steps.
 
 The `model` and `diffusion` blocks must match the checkpoint you are loading — in particular `image_size` and `num_frames`, or the weights will not load.
-
-### Faster sampling with DDIM
-
-By default sampling walks all `timesteps` (1000) denoising steps. `ddim` walks a strided subsequence of the same chain, so one video costs `ddim_steps` network calls instead of 1000 — roughly a `1000 / ddim_steps` speedup. It reuses the **same trained checkpoint**; there is nothing to retrain.
-
-```bash
-python inference.py --video_type dense --sampler ddim --ddim_steps 50
-```
-
-DDPM remains the default so existing results are unchanged. Fewer steps trades fidelity for speed, so compare against the DDPM output on a few videos before running a whole split. If a low step count looks bad, try `--ddim_start_t 998`, then `--ddim_spacing logsnr`, then `--ddim_clip_x_start dynamic`.
 
 Outputs are saved to `./<experiment_name>/sampling_time_sampled_<video_type>_part_videos_infos/`, created automatically.
