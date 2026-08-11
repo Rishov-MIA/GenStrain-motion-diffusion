@@ -77,6 +77,9 @@ from video_diffusion_pytorch.trainer_group_dro import (
     GroupDROTrainer,
     GroupedContourDataset,
 )
+# trainer_ddp is the shared home for DDP reduction helpers (see also
+# trainer_inverse_freq_ddp); this module keeps its own is_dist/get_rank copies.
+from video_diffusion_pytorch.trainer_ddp import global_metric_items
 from video_diffusion_pytorch.frame_validity import load_valid_frames_map
 
 try:
@@ -168,6 +171,10 @@ class GroupDRODDPTrainer(GroupDROTrainer):
         self.dro_eta_q = float(kwargs.get("dro_eta_q", 0.02))
         self.dro_adjustment_c = float(kwargs.get("dro_adjustment_c", 0.0))
         self.dro_freeze_q = bool(kwargs.get("dro_freeze_q", False))
+        # Normalize L_g by the group's relative motion scale before scoring; see
+        # GroupDROTrainer.motion_scale. Acts on the GLOBAL group loss, so like
+        # eta_q it needs no rescaling by world size.
+        self.dro_score_normalize = bool(kwargs.get("dro_score_normalize", True))
         self.weight_decay = float(kwargs.get("weight_decay", 0.0))
         self.num_workers = int(kwargs.get("num_workers", 4))
         # Disease groups to keep, in string-match PRIORITY order (first match
@@ -230,11 +237,21 @@ class GroupDRODDPTrainer(GroupDROTrainer):
             # the GLOBAL group loss (identical across ranks); only rank 0 logs it.
             self._group_loss_sum = {name: 0.0 for name in self.group_names}
             self._group_loss_count = {name: 0 for name in self.group_names}
+            # Same, per displacement metric: {group: {metric: sum}}. Fed the
+            # all-reduced values, so every rank holds identical running means.
+            self._group_disp_sum = {name: {} for name in self.group_names}
+            self._group_disp_count = {name: {} for name in self.group_names}
             self.dro_log_q = torch.full(
                 (len(self.group_names),),
                 -math.log(len(self.group_names)),
                 dtype=torch.float32,
                 device=self.device,
+            )
+            # Per-group mean ||u_GT||^2, the DRO score normalizer. Fed the global
+            # (all-reduced) estimate, so r_g stays bit-identical across ranks and
+            # the q update does not desync.
+            self.dro_group_msq = torch.full(
+                (len(self.group_names),), float("nan"), dtype=torch.float32, device=self.device
             )
 
             # Per-group, per-rank loaders (with replacement). Seeding the sampler
@@ -277,6 +294,7 @@ class GroupDRODDPTrainer(GroupDROTrainer):
             self.group_names = []
             self.group_counts = torch.empty(0, dtype=torch.float32, device=self.device)
             self.dro_log_q = torch.empty(0, dtype=torch.float32, device=self.device)
+            self.dro_group_msq = torch.empty(0, dtype=torch.float32, device=self.device)
             self.ddp_model = self.model
 
         self.step = 0
@@ -338,6 +356,9 @@ class GroupDRODDPTrainer(GroupDROTrainer):
             "dro_eta_q": self.dro_eta_q,
             "dro_adjustment_c": self.dro_adjustment_c,
             "dro_weight_decay": self.weight_decay,
+            # Carried so a resume keeps the converged motion scales instead of
+            # re-warming them (and briefly mis-normalizing the score) each restart.
+            "dro_group_msq": self.dro_group_msq.detach().cpu(),
         }
         torch.save(ckpt, str(self.checkpoints_folder / f"model-{milestone}.pt"))
 
@@ -387,6 +408,12 @@ class GroupDRODDPTrainer(GroupDROTrainer):
         # Every rank loads the same q so ranks stay in lockstep.
         self.dro_log_q = ckpt["dro_log_q"].to(self.device, dtype=torch.float32)
 
+        # Same for the motion scales. Absent in checkpoints written before score
+        # normalization existed; the EMA then re-warms from the first steps.
+        ckpt_msq = ckpt.get("dro_group_msq")
+        if ckpt_msq is not None and ckpt_msq.shape == self.dro_group_msq.shape:
+            self.dro_group_msq = ckpt_msq.to(self.device, dtype=torch.float32)
+
     # ---- group selection: rank 0 chooses, all ranks agree ----
 
     def sample_group_idx(self):
@@ -425,7 +452,7 @@ class GroupDRODDPTrainer(GroupDROTrainer):
             valid_frames = valid_frames.to(self.device, non_blocking=True) if self.use_frame_validity else None
 
             with autocast(enabled=self.amp):
-                loss, x0, x_start, disp_recon_mse = self.ddp_model(
+                loss, x0, x_start, disp_recon_mse, disp_metrics = self.ddp_model(
                     input_video,
                     cond=[contour_cond_video],
                     valid_frames=valid_frames,
@@ -438,7 +465,16 @@ class GroupDRODDPTrainer(GroupDROTrainer):
             global_loss = self._global_group_loss(loss)
             # Displacement reconstruction MSE, averaged across ranks the same way.
             global_disp_recon_mse = self._global_group_loss(disp_recon_mse)
-            score, q_g = self.update_dro_weight(group_idx, global_loss)
+            # Displacement metrics too — every rank must feed motion_scale the same
+            # number, or r_g diverges and the q updates stop matching.
+            disp_items = global_metric_items(disp_metrics, self.world_size)
+
+            # Motion-normalized DRO score: q is allocated on L_g / r_g, so a group
+            # is not treated as solved merely because its hearts move less. The
+            # BACKWARD stays q_g * loss — normalizing per-sample gradients would
+            # be unbounded exactly on the near-static samples. See `motion_scale`.
+            r_g = self.motion_scale(group_idx, disp_items.get("gt_disp_msq"))
+            score, q_g = self.update_dro_weight(group_idx, global_loss / r_g)
 
             # Backward on q_g * local_loss. DDP averages grads across ranks, giving
             # q_g * mean_ranks(local grads) == q_g * grad(global L_g). With q frozen,
@@ -452,15 +488,19 @@ class GroupDRODDPTrainer(GroupDROTrainer):
                 "disp_recon_mse": global_disp_recon_mse.item(),
                 "dro_score": score.item(),
                 "dro_q": q_g.item(),
+                "dro_motion_scale": r_g,
                 "group": group_name,
+                **disp_items,
             }
 
             if is_main_process():
                 q_parts = ", ".join(f"{name}={q:.4f}" for name, q in zip(self.group_names, self.dro_q.detach().cpu()))
+                disp_parts = "".join(f" {k}={v:.6f}" for k, v in sorted(disp_items.items()))
                 print(
                     f"{self.step}: group={group_name} "
                     f"loss={global_loss.item():.6f} weighted={weighted_loss.item():.6f} "
-                    f"disp_recon_mse={global_disp_recon_mse.item():.6f} q={q_g.item():.6f} | {q_parts}"
+                    f"disp_recon_mse={global_disp_recon_mse.item():.6f} q={q_g.item():.6f} "
+                    f"r={r_g:.4f}{disp_parts} | {q_parts}"
                 )
 
             if exists(self.max_grad_norm):
@@ -520,6 +560,7 @@ class GroupDRODDPTrainer(GroupDROTrainer):
                 step_loss = global_loss.item()
                 self._group_loss_sum[group_name] += step_loss
                 self._group_loss_count[group_name] += 1
+                disp_curves = self.accumulate_group_disp(group_name, disp_items)
 
                 # Log the scalar fields plus per-group q_<name> curves; skip the
                 # string "group" field (wandb can't plot it).
@@ -535,6 +576,7 @@ class GroupDRODDPTrainer(GroupDROTrainer):
                     count = self._group_loss_count[name]
                     if count > 0:
                         wandb_log[f"loss_{name}_cummean"] = self._group_loss_sum[name] / count
+                wandb_log.update(disp_curves)
                 wandb.log(wandb_log, step=self.step)
 
             log_fn(log)

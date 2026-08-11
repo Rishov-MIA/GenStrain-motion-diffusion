@@ -61,6 +61,7 @@ from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_after_o
     Trainer,
     cycle,
     exists,
+    finite_metric_items,
     noop,
     normalize_cond_img,
     random_pick_condition_videos,
@@ -354,7 +355,7 @@ class InverseFrequencyTrainer(Trainer):
             valid_frames = valid_frames.to(self.device, non_blocking=True) if self.use_frame_validity else None
 
             with autocast(enabled=self.amp):
-                per_sample_loss, x0, x_start, per_sample_mse = self.model(
+                per_sample_loss, x0, x_start, per_sample_mse, disp_metrics = self.model(
                     input_video,
                     cond=[contour_cond_video],
                     valid_frames=valid_frames,
@@ -373,17 +374,25 @@ class InverseFrequencyTrainer(Trainer):
             unweighted_loss = per_sample_loss.detach().float().mean()
             disp_recon_mse = per_sample_mse.detach().float().mean()
             per_group_now = self.accumulate_group_losses(per_sample_loss, group_idx)
+            # Displacement metrics are batch scalars and this batch is a MIXTURE of
+            # groups, so unlike the Group-DRO trainers they cannot be attributed to
+            # a group. Logged whole-batch only. Nothing here feeds the weighting:
+            # inverse-frequency weights come from class counts, not from the loss,
+            # so there is no score to motion-normalize.
+            disp_items = finite_metric_items(disp_metrics)
 
             log = {
                 "loss": loss.item(),
                 "unweighted_loss": unweighted_loss.item(),
                 "disp_recon_mse": disp_recon_mse.item(),
+                **disp_items,
             }
 
             group_parts = ", ".join(f"{name}={value:.4f}" for name, value in per_group_now.items())
+            disp_parts = "".join(f" {k}={v:.6f}" for k, v in sorted(disp_items.items()))
             print(
                 f"{self.step}: loss={loss.item():.6f} unweighted={unweighted_loss.item():.6f} "
-                f"disp_recon_mse={disp_recon_mse.item():.6f} | {group_parts}"
+                f"disp_recon_mse={disp_recon_mse.item():.6f}{disp_parts} | {group_parts}"
             )
 
             if exists(self.max_grad_norm):

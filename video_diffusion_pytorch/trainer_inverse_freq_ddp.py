@@ -67,6 +67,7 @@ from video_diffusion_pytorch.trainer_ddp import (
     cleanup_distributed,
     get_rank,
     get_world_size,
+    global_metric_items,
     is_dist,
     is_main_process,
     setup_distributed,
@@ -408,7 +409,7 @@ class InverseFrequencyDDPTrainer(InverseFrequencyTrainer):
             valid_frames = valid_frames.to(self.device, non_blocking=True) if self.use_frame_validity else None
 
             with autocast(enabled=self.amp):
-                per_sample_loss, x0, x_start, per_sample_mse = self.ddp_model(
+                per_sample_loss, x0, x_start, per_sample_mse, disp_metrics = self.ddp_model(
                     input_video,
                     cond=[contour_cond_video],
                     valid_frames=valid_frames,
@@ -427,18 +428,25 @@ class InverseFrequencyDDPTrainer(InverseFrequencyTrainer):
             global_unweighted = self._global_mean(per_sample_loss.mean())
             global_disp_recon_mse = self._global_mean(per_sample_mse.mean())
             per_group_now = self.accumulate_group_losses(per_sample_loss, group_idx)
+            # Batch scalars over a MIXTURE of groups, so unlike the Group-DRO
+            # trainers they cannot be split per group — whole-batch only. Nothing
+            # here feeds the weighting: inverse-frequency weights come from class
+            # counts, not from the loss, so there is no score to motion-normalize.
+            disp_items = global_metric_items(disp_metrics, self.world_size)
 
             log = {
                 "loss": global_loss.item(),
                 "unweighted_loss": global_unweighted.item(),
                 "disp_recon_mse": global_disp_recon_mse.item(),
+                **disp_items,
             }
 
             if is_main_process():
                 group_parts = ", ".join(f"{name}={value:.4f}" for name, value in per_group_now.items())
+                disp_parts = "".join(f" {k}={v:.6f}" for k, v in sorted(disp_items.items()))
                 print(
                     f"{self.step}: loss={log['loss']:.6f} unweighted={log['unweighted_loss']:.6f} "
-                    f"disp_recon_mse={log['disp_recon_mse']:.6f} | {group_parts}"
+                    f"disp_recon_mse={log['disp_recon_mse']:.6f}{disp_parts} | {group_parts}"
                 )
 
             if exists(self.max_grad_norm):

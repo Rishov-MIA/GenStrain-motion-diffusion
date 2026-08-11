@@ -48,10 +48,12 @@ except ImportError:  # torch < 2.3
 
 from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_after_only_contour import (
     Trainer,
+    DISP_REL_KEYS,
     EMA,
     Dataset,
     cycle,
     exists,
+    finite_metric_items,
     noop,
     normalize_cond_img,
     random_pick_condition_videos,
@@ -102,6 +104,28 @@ def setup_distributed():
 def cleanup_distributed():
     if is_dist():
         torch.distributed.destroy_process_group()
+
+
+def global_metric_items(metrics, world_size):
+    """{name: float} for a metric dict, averaged across ranks.
+
+    Iterates in SORTED key order: all_reduce is a collective, so every rank must
+    issue the same calls in the same sequence or the job deadlocks. Dict order is
+    identical across ranks in practice, but sorting removes the failure mode.
+
+    A NaN on any rank propagates through the SUM and drops the metric on every
+    rank for that step. That is deliberate: it keeps ranks in agreement, and the
+    alternative (per-rank filtering) would silently desync their running sums.
+    """
+    out = {}
+    for name in sorted(metrics):
+        value = metrics[name].detach().float()
+        if is_dist():
+            value = value.clone()
+            torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
+            value = value / world_size
+        out[name] = value
+    return finite_metric_items(out)
 
 
 class DDPTrainer(Trainer):
@@ -220,6 +244,8 @@ class DDPTrainer(Trainer):
             wandb.define_metric("epoch")
             wandb.define_metric("epoch_loss", step_metric="epoch")
             wandb.define_metric("epoch_disp_recon_mse", step_metric="epoch")
+            for name in self._disp_metric_names():
+                wandb.define_metric(f"epoch_{name}", step_metric="epoch")
 
         # True cumulative mean-since-start of the training loss (rank 0 uses the
         # local loss, matching the console print). Not checkpointed.
@@ -242,6 +268,11 @@ class DDPTrainer(Trainer):
         self._epoch_loss_sum = 0.0
         self._epoch_disp_recon_mse_sum = 0.0
         self._epoch_step_count = 0
+        # Epoch sums for the displacement metrics. These carry their OWN counts:
+        # a step whose batch had no usable motion normalizer contributes nothing,
+        # so _epoch_step_count would be the wrong denominator.
+        self._epoch_disp_sums = {}
+        self._epoch_disp_counts = {}
 
         from pathlib import Path
 
@@ -258,6 +289,16 @@ class DDPTrainer(Trainer):
     def raw_model(self):
         """The underlying nn.Module regardless of DDP wrapping."""
         return self.ddp_model.module if isinstance(self.ddp_model, DDP) else self.ddp_model
+
+    def _disp_metric_names(self):
+        """Metric names p_losses will emit, so wandb epoch panels can be declared
+        up front rather than on the first epoch boundary. gt_disp_msq is always
+        present; the ratio depends on the model's disp_rel_metric form."""
+        names = ["gt_disp_msq"]
+        form = getattr(self.raw_model, "disp_rel_metric", None)
+        if form in DISP_REL_KEYS:
+            names.extend(DISP_REL_KEYS[form])
+        return sorted(set(names))
 
     def save(self, milestone):
         if not is_main_process():
@@ -325,6 +366,8 @@ class DDPTrainer(Trainer):
         self._epoch_loss_sum = 0.0
         self._epoch_disp_recon_mse_sum = 0.0
         self._epoch_step_count = 0
+        self._epoch_disp_sums = {}
+        self._epoch_disp_counts = {}
         if is_main_process():
             epoch_bar = tqdm(
                 total=self.steps_per_epoch,
@@ -355,7 +398,7 @@ class DDPTrainer(Trainer):
 
                 with sync_ctx:
                     with autocast(enabled=self.amp):
-                        loss, _, _, disp_recon_mse = self.ddp_model(
+                        loss, _, _, disp_recon_mse, disp_metrics = self.ddp_model(
                             input_video,
                             cond=[contour_cond_video],
                             valid_frames=valid_frames,
@@ -380,16 +423,26 @@ class DDPTrainer(Trainer):
                 global_loss = loss.item()
                 global_disp_recon_mse = disp_recon_mse.item()
 
+            # Same treatment for the displacement metrics. Every rank calls this
+            # (the all_reduce inside is collective), but only rank 0 logs.
+            disp_items = global_metric_items(disp_metrics, self.world_size)
+
             # Per-step loss line. Print/log the GLOBAL (all-rank averaged) loss so
             # it reflects the full effective batch, not just rank 0's shard —
             # consistent with the Group-DRO DDP trainer. Route through the bar's
             # writer so it scrolls above the pinned epoch progress bar.
             if is_main_process():
+                disp_parts = "".join(f" | {k}: {v}" for k, v in sorted(disp_items.items()))
                 epoch_bar.write(
-                    f"{self.step}: {global_loss} | disp_recon_mse: {global_disp_recon_mse}"
+                    f"{self.step}: {global_loss} | disp_recon_mse: {global_disp_recon_mse}{disp_parts}"
                 )
 
-            log = {"loss": global_loss, "disp_recon_mse": global_disp_recon_mse, "step": self.step}
+            log = {
+                "loss": global_loss,
+                "disp_recon_mse": global_disp_recon_mse,
+                "step": self.step,
+                **disp_items,
+            }
             # Cumulative mean of the (global) loss since start (rank 0 only; it's the
             # sole consumer of `log` via wandb, and only rank 0 logs).
             if is_main_process():
@@ -405,26 +458,39 @@ class DDPTrainer(Trainer):
             self._epoch_loss_sum += global_loss
             self._epoch_disp_recon_mse_sum += global_disp_recon_mse
             self._epoch_step_count += 1
+            for name, value in disp_items.items():
+                self._epoch_disp_sums[name] = self._epoch_disp_sums.get(name, 0.0) + value
+                self._epoch_disp_counts[name] = self._epoch_disp_counts.get(name, 0) + 1
             if is_main_process():
                 epoch_bar.update(1)
                 epoch_bar.set_postfix(loss=global_loss)
             if self._epoch_step_count >= self.steps_per_epoch:
                 epoch_loss = self._epoch_loss_sum / self._epoch_step_count
                 epoch_disp_recon_mse = self._epoch_disp_recon_mse_sum / self._epoch_step_count
+                # Per-metric counts, not _epoch_step_count: steps that produced no
+                # usable value are absent from the sums and must not be divided in.
+                epoch_disp = {
+                    f"epoch_{name}": total / self._epoch_disp_counts[name]
+                    for name, total in self._epoch_disp_sums.items()
+                }
                 epoch = (self.step + 1) // self.steps_per_epoch
                 if is_main_process():
+                    epoch_parts = "".join(f" | {k} {v}" for k, v in sorted(epoch_disp.items()))
                     epoch_bar.write(
                         f"  epoch {epoch} | epoch_loss {epoch_loss} | "
-                        f"epoch_disp_recon_mse {epoch_disp_recon_mse}"
+                        f"epoch_disp_recon_mse {epoch_disp_recon_mse}{epoch_parts}"
                     )
                     log["epoch"] = epoch
                     log["epoch_loss"] = epoch_loss
                     log["epoch_disp_recon_mse"] = epoch_disp_recon_mse
+                    log.update(epoch_disp)
                     epoch_bar.reset()
                     epoch_bar.set_description(f"epoch {epoch + 1}")
                 self._epoch_loss_sum = 0.0
                 self._epoch_disp_recon_mse_sum = 0.0
                 self._epoch_step_count = 0
+                self._epoch_disp_sums = {}
+                self._epoch_disp_counts = {}
 
             if exists(self.max_grad_norm):
                 self.scaler.unscale_(self.opt)

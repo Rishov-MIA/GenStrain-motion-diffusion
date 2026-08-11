@@ -25,7 +25,8 @@
         "channels": 2,
         "timesteps": 1000,
         "loss_type": "l2",
-        "contour_noise_only": false
+        "contour_noise_only": false,
+        "disp_rel_metric": "mse"
     },
     "training": {
         "per_gpu_batch_size": 8,

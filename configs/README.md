@@ -186,6 +186,28 @@ In DDP only rank 0 writes.
 - `contour_noise_only` — true = noise only inside the mask contour region,
   false = full image. Not present for `train_only_motion.json` (that model
   has no contour input).
+- `disp_rel_metric` — which **motion-normalized displacement ratio** to log
+  alongside `disp_recon_mse`, scored over the contour ROI only:
+  - `"mse"` (default) — `mse_disp_rel` = `mean‖Δu‖² / mean‖u_GT‖²` (normalized
+    MSE, i.e. 1−R²).
+  - `"epe"` — `epe_disp_rel` = `mean‖Δu‖₂ / mean‖u_GT‖₂`. Same definition and
+    name as the `epe_disp_rel` column StrainAnalysis writes, so the training
+    curve and the paper table are the same quantity.
+  - `null` — no ratio.
+
+  Both ratios are dimensionless: 0 is perfect, **1.0 is exactly as bad as
+  predicting zero motion**, >1 is worse than that. Being ratios they cancel the
+  `/5` normalization and any per-sample displacement unit scale, neither of
+  which `disp_recon_mse` is immune to. They are **not** each other's square —
+  never compare a run logged under one form against a run logged under the other.
+
+  `gt_disp_msq` (mean `‖u_GT‖²` over the ROI) is logged regardless of this
+  setting, because Group-DRO consumes it as the score normalizer below.
+
+  Note these are single-step estimates of `x0` at a randomly drawn `t`, so the
+  per-step value is noisy and much larger than the same metric computed on fully
+  sampled outputs. Read the epoch/cumulative curves, and keep the authoritative
+  numbers in the StrainAnalysis pipeline.
 
 ### `training`
 - `batch_size` (single GPU) / `per_gpu_batch_size` (DDP). In DDP the
@@ -259,6 +281,30 @@ thousands of steps in.
   loss, disabling DRO reweighting. Sampling is still group-balanced
   (uniform-over-groups), so this is NOT identical to base GenStrain's
   natural-distribution training. Set false for real group-DRO.
+- `score_normalize` (default **true**) — divide `L_g` by the group's relative
+  motion scale before it becomes the DRO score.
+
+  **Why.** The achievable ε-MSE is `(ᾱ/(1-ᾱ)) · Var[x0 | x_t]`, and scaling a
+  group's displacement by `k` scales `Var[x0]` — hence the loss — by `k²`. So a
+  hypokinetic (diseased) group has a genuinely *lower loss floor*. DRO reads the
+  raw loss level rather than the excess over that floor, concludes the group is
+  already solved, and steers q away from it. Normalizing leaves DRO comparing
+  how well each group is served *relative to how much its hearts actually move*.
+  The divisor is the mean **square** displacement (`gt_disp_msq`), not the
+  magnitude, because that is what scales with the loss.
+
+  **What it does and does not touch.** Only the scalar fed to the q update. The
+  backward stays `q_g * loss` — normalizing per-sample gradients would be an
+  unbounded multiplier exactly on the near-static samples. The divisor is `r_g =
+  msq_g / mean_g(msq)`, a *relative* scale centered on 1.0 and clamped to
+  `[0.25, 4]`, so the score keeps its usual units and **`eta_q` /
+  `adjustment_c` need no retuning**. `r_g` is logged per step as
+  `dro_motion_scale`, and `gt_disp_msq_<group>_cummean` shows each group's scale.
+
+  Set `false` to reproduce runs from before this existed. Note the correction is
+  weakest early in training: at init the model predicts ≈0 and the ε-loss is ≈1
+  per dimension for *every* group regardless of motion, so the division briefly
+  over-corrects. Watch the `q_<group>` curves over the first few thousand steps.
 - `allowed_disease_groups` — REQUIRED list of disease groups to keep, in
   string-match PRIORITY order (first match wins); there is no hardcoded fallback
   (training errors out if it is missing/empty). A metadata disease string is

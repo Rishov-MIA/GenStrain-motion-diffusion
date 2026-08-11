@@ -683,6 +683,108 @@ def extract_noise_mask_from_first_frame(mask):
     return first_frame.unsqueeze(2).expand(-1, -1, f, -1, -1)
 
 
+# Key names for the motion-normalized displacement ratio, by `disp_rel_metric`
+# form. "epe" reproduces the epe_disp_rel column that StrainAnalysis writes
+# (scripts/compute/calculate_mse_strain_paired_isbi_new_barplot.py), so a
+# training curve and the paper table are then the same quantity.
+DISP_REL_KEYS = {
+    "mse": ("mse_disp_rel", "gt_disp_msq"),
+    "epe": ("epe_disp_rel", "gt_disp_mag"),
+}
+
+
+def _batch_mean(values, valid):
+    """Mean of `values` over the samples flagged valid; NaN when none are."""
+    if not bool(valid.any()):
+        return torch.full((), float("nan"), device=values.device, dtype=torch.float32)
+    return values[valid].mean()
+
+
+def displacement_roi_metrics(pred, gt, region, form=None, eps=1e-6):
+    """Motion-normalized displacement error over an ROI, plus its normalizer.
+
+    Absolute displacement error scales with how much the heart actually moves,
+    so hypokinetic (diseased) cases score lower for free even at equal relative
+    accuracy. Dividing by the ground-truth motion over the SAME ROI removes
+    that: the ratio is dimensionless -- 0 is perfect, 1.0 is exactly as bad as
+    predicting zero motion, >1 is worse than that -- and it cancels both the /5
+    normalization and any per-sample displacement unit scale, neither of which
+    `disp_recon_mse` is immune to. Mirrors `epe_disp_rel` in StrainAnalysis
+    (scripts/compute/calculate_mse_strain_paired_isbi_new_barplot.py).
+
+    `gt_disp_msq` (mean ||u_GT||^2 over the ROI) comes back unconditionally,
+    because it is also the Group-DRO score normalizer: the achievable eps-MSE
+    scales with Var[x0 | x_t], which scales with the SQUARE of the displacement
+    amplitude, so the mean square -- not the magnitude -- is the dimensionally
+    right divisor for a loss. It reads only the ground truth, never the model's
+    x0 and never t, so unlike the ratios it is a stable, low-variance statistic
+    that needs no smoothing before it can steer anything.
+
+    Args:
+        pred, gt: [B, C, F, H, W] displacement fields in the same units.
+        region:   [B, 1, F, H, W] ROI mask, 1 inside, broadcast over channels.
+                  Masking is not optional: over the whole frame the denominator
+                  is mostly background zeros, which inflates every ratio by
+                  roughly the inverse myocardial area fraction.
+        form:     "mse" -> mean||du||^2 / mean||u_GT||^2 (normalized MSE, 1-R^2)
+                  "epe" -> mean||du||_2 / mean||u_GT||_2, matching epe_disp_rel
+                  None  -> normalizer only, no ratio.
+                  Both ratios are 1.0 for a zero-motion predictor but are NOT
+                  each other's square; never compare a run across forms.
+
+    Returns:
+        {name: 0-dim tensor}. Ratios are batch means over the samples with a
+        usable denominator; a sample whose GT is motionless over the ROI (or
+        whose ROI came out empty) is dropped rather than divided by an epsilon,
+        the same way _safe_ratio and the accumulators do in StrainAnalysis. NaN
+        when no sample qualifies, so callers must filter -- see
+        `finite_metric_items`.
+    """
+    # float32 throughout: under AMP x0 is fp16, and predict_start_from_noise
+    # scales it by ~1/sqrt(alphas_cumprod) (~6.5e4 at t=999), so squaring that
+    # in fp16 overflows to inf and silently poisons every downstream sum.
+    pred = pred.detach().float()
+    gt = gt.detach().float()
+    roi = region[:, 0].detach().float()           # [B, F, H, W]
+    n_roi = roi.flatten(1).sum(1).clamp(min=1.0)  # [B]
+
+    def roi_mean(values):
+        return (values * roi).flatten(1).sum(1) / n_roi  # [B]
+
+    sq_gt = (gt ** 2).sum(dim=1)  # per-pixel ||u_GT||^2, [B, F, H, W]
+    gt_msq = roi_mean(sq_gt)
+
+    metrics = {"gt_disp_msq": _batch_mean(gt_msq, gt_msq > eps)}
+    if form is None:
+        return metrics
+
+    sq_err = ((pred - gt) ** 2).sum(dim=1)
+    if form == "mse":
+        err, scale = roi_mean(sq_err), gt_msq
+    elif form == "epe":
+        err, scale = roi_mean(sq_err.sqrt()), roi_mean(sq_gt.sqrt())
+    else:
+        raise ValueError(f"unknown disp_rel_metric {form!r}, expected 'mse', 'epe' or None")
+
+    rel_key, scale_key = DISP_REL_KEYS[form]
+    valid = scale > eps
+    metrics[rel_key] = _batch_mean(err / scale.clamp(min=eps), valid)
+    metrics[scale_key] = _batch_mean(scale, valid)
+    return metrics
+
+
+def finite_metric_items(metrics):
+    """{name: float} for the finite entries of a metric dict.
+
+    The relative displacement metrics are NaN when no sample in the batch had a
+    usable motion normalizer. Filtering at every logging site keeps that NaN out
+    of the wandb log and, more importantly, out of the running epoch and
+    cumulative sums, where a single one would poison the mean for the rest of
+    the run.
+    """
+    return {name: value.item() for name, value in metrics.items() if torch.isfinite(value)}
+
+
 def cosine_beta_schedule(timesteps, s=0.008):
     """
     cosine schedule
@@ -712,6 +814,7 @@ class GaussianDiffusion(nn.Module):
         global_means=None,
         global_stds=None,
         contour_noise_only=False,
+        disp_rel_metric="mse",
     ):
         super().__init__()
         self.channels = channels
@@ -719,6 +822,17 @@ class GaussianDiffusion(nn.Module):
         self.num_frames = num_frames
         self.denoise_fn = denoise_fn
         self.contour_noise_only = contour_noise_only
+
+        # Which motion-normalized displacement ratio p_losses reports: "mse",
+        # "epe", or None for no ratio. This is a REPORTING choice only -- the
+        # score normalizer gt_disp_msq comes back regardless, because Group-DRO
+        # consumes it and the objective must not depend on a logging flag.
+        # See `displacement_roi_metrics`.
+        if disp_rel_metric not in (None, "mse", "epe"):
+            raise ValueError(
+                f"unknown disp_rel_metric {disp_rel_metric!r}, expected 'mse', 'epe' or None"
+            )
+        self.disp_rel_metric = disp_rel_metric
 
         betas = cosine_beta_schedule(timesteps)
 
@@ -1107,10 +1221,19 @@ class GaussianDiffusion(nn.Module):
         if valid_frames is not None:
             frame_mask = build_frame_mask(valid_frames, f, device=device, dtype=x_start.dtype)
 
+        # Contour ROI from the condition's first frame, [B, 1, F, H, W]. Computed
+        # regardless of contour_noise_only -- that flag decides whether the LOSS
+        # is masked, while the displacement metrics below are always scored over
+        # the myocardium only (over the whole frame their denominator would be
+        # mostly background zeros). Same region StrainAnalysis scores over.
+        roi_mask = None
+        if cond is not None and isinstance(cond[0], torch.Tensor):
+            roi_mask = extract_noise_mask_from_first_frame(cond[0])
+
         # When contour_noise_only is enabled, mask noise using first frame of condition mask
         noise_mask = None
-        if self.contour_noise_only and cond is not None and isinstance(cond[0], torch.Tensor):
-            noise_mask = extract_noise_mask_from_first_frame(cond[0])  # [B, 1, F, H, W]
+        if self.contour_noise_only and roi_mask is not None:
+            noise_mask = roi_mask  # [B, 1, F, H, W]
             noise = noise * noise_mask  # broadcasts to [B, 2, F, H, W]
 
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
@@ -1148,6 +1271,19 @@ class GaussianDiffusion(nn.Module):
             disp_recon_mse = reduce((x_start - x0) ** 2 * frame_mask) / reduce(
                 frame_mask.expand_as(x_start)
             ).clamp(min=1.0)
+
+        # Motion-normalized displacement metrics over the contour ROI (and, when
+        # given, the valid frames only). Diagnostics plus the Group-DRO score
+        # normalizer -- never part of the gradient, hence no_grad: it keeps the
+        # extra activations out of the graph and the sqrt(0) derivative out of
+        # the backward pass. Always a batch scalar, even under per_sample.
+        disp_metrics = {}
+        if roi_mask is not None:
+            with torch.no_grad():
+                region = roi_mask if frame_mask is None else roi_mask * frame_mask
+                disp_metrics = displacement_roi_metrics(
+                    x0, x_start, region, form=self.disp_rel_metric
+                )
 
         if self.contour_noise_only and noise_mask is not None:
             # Compute loss only in the contour region
@@ -1201,8 +1337,16 @@ class GaussianDiffusion(nn.Module):
                 denom = reduce(frame_mask.expand_as(per_element)).clamp(min=1.0)
                 loss = reduce(per_element * frame_mask) / denom
 
-        return loss, unnormalize_divide_by_5(x0), unnormalize_divide_by_5(x_start), disp_recon_mse
-        
+        # 5th element is a dict so the next diagnostic does not change the arity
+        # again. Empty when there is no contour condition to build an ROI from.
+        return (
+            loss,
+            unnormalize_divide_by_5(x0),
+            unnormalize_divide_by_5(x_start),
+            disp_recon_mse,
+            disp_metrics,
+        )
+
     def forward(self, x, cond=None, *args, valid_frames=None, per_sample=False, **kwargs):
         # cond type: [contour_cond_video]
         # per_sample must be a NAMED parameter here, not left to **kwargs: kwargs is
@@ -1673,7 +1817,7 @@ class Trainer(object):
                 valid_frames = valid_frames.cuda() if self.use_frame_validity else None
 
                 with autocast(enabled=self.amp):
-                    loss, x0, x_start, disp_recon_mse = self.model(
+                    loss, x0, x_start, disp_recon_mse, disp_metrics = self.model(
                         input_video,
                         cond=[contour_cond_video],
                         valid_frames=valid_frames,
@@ -1683,10 +1827,15 @@ class Trainer(object):
 
                     self.scaler.scale(loss / self.gradient_accumulate_every).backward()
 
+                # Drop any metric whose batch had no usable motion normalizer,
+                # before it can reach a log line or a running sum.
+                disp_items = finite_metric_items(disp_metrics)
+                disp_parts = "".join(f" | {k}: {v}" for k, v in sorted(disp_items.items()))
+
                 # Route through the bar's writer so per-step loss lines scroll above
                 # the pinned epoch progress bar instead of fighting it.
                 epoch_bar.write(
-                    f"{self.step}: {loss.item()} | disp_recon_mse: {disp_recon_mse.item()}"
+                    f"{self.step}: {loss.item()} | disp_recon_mse: {disp_recon_mse.item()}{disp_parts}"
                 )
 
             # Accumulate the true cumulative mean of the loss since the start.
@@ -1698,6 +1847,7 @@ class Trainer(object):
                 "loss_cummean": self._loss_sum / self._loss_count,
                 "disp_recon_mse": disp_recon_mse.item(),
                 "step": self.step,
+                **disp_items,
             }
 
             # Accumulate the epoch loss / disp_recon_mse and advance the epoch bar.

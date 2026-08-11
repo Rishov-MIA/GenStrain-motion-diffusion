@@ -105,6 +105,8 @@ def main():
         timesteps=diffusion_cfg["timesteps"],
         loss_type=diffusion_cfg["loss_type"],
         contour_noise_only=diffusion_cfg["contour_noise_only"],
+        # Optional: predates most configs, so .get() with the default.
+        disp_rel_metric=diffusion_cfg.get("disp_rel_metric", "mse"),
     ).to(device)
 
     base_path = Path(data_cfg["base_path"])

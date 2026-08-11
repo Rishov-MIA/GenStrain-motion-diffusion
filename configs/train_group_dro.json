@@ -26,7 +26,8 @@
         "channels": 2,
         "timesteps": 1000,
         "loss_type": "l2",
-        "contour_noise_only": false
+        "contour_noise_only": false,
+        "disp_rel_metric": "mse"
     },
     "training": {
         "batch_size": 16,
@@ -49,6 +50,7 @@
         "eta_q": 0.04,
         "adjustment_c": 1.0,
         "freeze_q": false,
+        "score_normalize": true,
         "_comment_allowed_disease_groups": "Order = string-match PRIORITY (first match wins). Entries are a group name string, or {name, exclude:[terms]} where exclude terms VETO the match. Here Healthy absorbs e.g. 'Healthy Cardiotoxicity' but drops 'Healthy Pediatric' (excluded by 'Pediatric'). A more specific name must precede a broader one.",
         "_available_disease_groups": [
             "Acute MI",
