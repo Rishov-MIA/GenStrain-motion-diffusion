@@ -821,6 +821,23 @@ def finite_metric_items(metrics):
     return {name: value.item() for name, value in metrics.items() if torch.isfinite(value)}
 
 
+# Displacement fields are divided by this before diffusion and multiplied back
+# after. 5.0 is the historical value, hardcoded until it became configurable via
+# `diffusion.disp_scale`; EVERY checkpoint trained before then assumes it, which
+# is why it stays the default and why the trainers record the scale they used
+# into the checkpoint and refuse to load it back under a different one.
+#
+# It is a pure change of units on x0, so it rescales nothing that is
+# dimensionless -- the disp_rel ratios and DRO's r_g are unaffected -- but it
+# does move the eps-prediction loss, whose floor scales with Var[x0], by
+# (5/scale)^2. Loss curves are therefore NOT comparable across scales.
+#
+# Defined HERE, above GaussianDiffusion, because it is a default argument value:
+# those are evaluated when the class body runs at import, so a definition further
+# down the file is a NameError at import time, not a lazy lookup.
+DEFAULT_DISP_SCALE = 5.0
+
+
 def cosine_beta_schedule(timesteps, s=0.008):
     """
     cosine schedule
@@ -1477,19 +1494,6 @@ class GaussianDiffusion(nn.Module):
 
 def identity(t, *args, **kwargs):
     return t
-
-
-# Displacement fields are divided by this before diffusion and multiplied back
-# after. 5.0 is the historical value, hardcoded until it became configurable via
-# `diffusion.disp_scale`; EVERY checkpoint trained before then assumes it, which
-# is why it stays the default and why the trainers record the scale they used
-# into the checkpoint and refuse to load it back under a different one.
-#
-# It is a pure change of units on x0, so it rescales nothing that is
-# dimensionless -- the disp_rel ratios and DRO's r_g are unaffected -- but it
-# does move the eps-prediction loss, whose floor scales with Var[x0], by
-# (5/scale)^2. Loss curves are therefore NOT comparable across scales.
-DEFAULT_DISP_SCALE = 5.0
 
 
 def normalize_disp(x: torch.Tensor, scale: float = DEFAULT_DISP_SCALE) -> torch.Tensor:
