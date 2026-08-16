@@ -23,7 +23,9 @@
         "channels": 2,
         "timesteps": 1000,
         "loss_type": "l2",
+        "disp_scale": 5.0,
         "contour_noise_only": false,
+        "disp_metrics": true,
         "disp_rel_metric": "mse"
     },
     "training": {

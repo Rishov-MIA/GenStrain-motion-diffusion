@@ -52,6 +52,7 @@ from video_diffusion_pytorch.frame_validity import (
     load_valid_frames_map,
     resolve_valid_frames,
 )
+from video_diffusion_pytorch.checkpoint_compat import record_disp_scale, verify_disp_scale
 
 # helpers functions
 
@@ -714,6 +715,112 @@ def extract_noise_mask_from_first_frame(mask):
     return first_frame.unsqueeze(2).expand(-1, -1, f, -1, -1)
 
 
+# Key names for the motion-normalized displacement ratio, by `disp_rel_metric`
+# form. "epe" reproduces the epe_disp_rel column that StrainAnalysis writes
+# (scripts/compute/calculate_mse_strain_paired_isbi_new_barplot.py), so a
+# training curve and the paper table are then the same quantity.
+DISP_REL_KEYS = {
+    "mse": ("mse_disp_rel", "gt_disp_msq"),
+    "epe": ("epe_disp_rel", "gt_disp_mag"),
+}
+
+
+def _batch_mean(values, valid):
+    """Mean of `values` over the samples flagged valid; NaN when none are."""
+    if not bool(valid.any()):
+        return torch.full((), float("nan"), device=values.device, dtype=torch.float32)
+    return values[valid].mean()
+
+
+def displacement_roi_metrics(pred, gt, region, form=None, eps=1e-6):
+    """Motion-normalized displacement error over an ROI, plus its normalizer.
+
+    Absolute displacement error scales with how much the heart actually moves,
+    so hypokinetic (diseased) cases score lower for free even at equal relative
+    accuracy. Dividing by the ground-truth motion over the SAME ROI removes
+    that: the ratio is dimensionless -- 0 is perfect, 1.0 is exactly as bad as
+    predicting zero motion, >1 is worse than that -- and it cancels both the /5
+    normalization and any per-sample displacement unit scale, neither of which
+    `disp_recon_mse` is immune to. Mirrors `epe_disp_rel` in StrainAnalysis
+    (scripts/compute/calculate_mse_strain_paired_isbi_new_barplot.py).
+
+    `gt_disp_msq` (mean ||u_GT||^2 over the ROI) comes back unconditionally,
+    because it is also the Group-DRO score normalizer: the achievable eps-MSE
+    scales with Var[x0 | x_t], which scales with the SQUARE of the displacement
+    amplitude, so the mean square -- not the magnitude -- is the dimensionally
+    right divisor for a loss. It reads only the ground truth, never the model's
+    x0 and never t, so unlike the ratios it is a stable, low-variance statistic
+    that needs no smoothing before it can steer anything.
+
+    NOTE: the ROI comes from the CONTOUR condition (cond[0]) only. The motion
+    condition never enters it, so this metric means exactly the same thing here
+    as in the contour-only lineage and the two are directly comparable.
+
+    Args:
+        pred, gt: [B, C, F, H, W] displacement fields in the same units.
+        region:   [B, 1, F, H, W] ROI mask, 1 inside, broadcast over channels.
+                  Masking is not optional: over the whole frame the denominator
+                  is mostly background zeros, which inflates every ratio by
+                  roughly the inverse myocardial area fraction.
+        form:     "mse" -> mean||du||^2 / mean||u_GT||^2 (normalized MSE, 1-R^2)
+                  "epe" -> mean||du||_2 / mean||u_GT||_2, matching epe_disp_rel
+                  None  -> normalizer only, no ratio.
+                  Both ratios are 1.0 for a zero-motion predictor but are NOT
+                  each other's square; never compare a run across forms.
+
+    Returns:
+        {name: 0-dim tensor}. Ratios are batch means over the samples with a
+        usable denominator; a sample whose GT is motionless over the ROI (or
+        whose ROI came out empty) is dropped rather than divided by an epsilon,
+        the same way _safe_ratio and the accumulators do in StrainAnalysis. NaN
+        when no sample qualifies, so callers must filter -- see
+        `finite_metric_items`.
+    """
+    # float32 throughout: under AMP x0 is fp16, and predict_start_from_noise
+    # scales it by ~1/sqrt(alphas_cumprod) (~6.5e4 at t=999), so squaring that
+    # in fp16 overflows to inf and silently poisons every downstream sum.
+    pred = pred.detach().float()
+    gt = gt.detach().float()
+    roi = region[:, 0].detach().float()           # [B, F, H, W]
+    n_roi = roi.flatten(1).sum(1).clamp(min=1.0)  # [B]
+
+    def roi_mean(values):
+        return (values * roi).flatten(1).sum(1) / n_roi  # [B]
+
+    sq_gt = (gt ** 2).sum(dim=1)  # per-pixel ||u_GT||^2, [B, F, H, W]
+    gt_msq = roi_mean(sq_gt)
+
+    metrics = {"gt_disp_msq": _batch_mean(gt_msq, gt_msq > eps)}
+    if form is None:
+        return metrics
+
+    sq_err = ((pred - gt) ** 2).sum(dim=1)
+    if form == "mse":
+        err, scale = roi_mean(sq_err), gt_msq
+    elif form == "epe":
+        err, scale = roi_mean(sq_err.sqrt()), roi_mean(sq_gt.sqrt())
+    else:
+        raise ValueError(f"unknown disp_rel_metric {form!r}, expected 'mse', 'epe' or None")
+
+    rel_key, scale_key = DISP_REL_KEYS[form]
+    valid = scale > eps
+    metrics[rel_key] = _batch_mean(err / scale.clamp(min=eps), valid)
+    metrics[scale_key] = _batch_mean(scale, valid)
+    return metrics
+
+
+def finite_metric_items(metrics):
+    """{name: float} for the finite entries of a metric dict.
+
+    The relative displacement metrics are NaN when no sample in the batch had a
+    usable motion normalizer. Filtering at every logging site keeps that NaN out
+    of the wandb log and, more importantly, out of the running epoch and
+    cumulative sums, where a single one would poison the mean for the rest of
+    the run.
+    """
+    return {name: value.item() for name, value in metrics.items() if torch.isfinite(value)}
+
+
 def cosine_beta_schedule(timesteps, s=0.008):
     """
     cosine schedule
@@ -743,6 +850,9 @@ class GaussianDiffusion(nn.Module):
         global_means=None,
         global_stds=None,
         contour_noise_only=False,
+        disp_rel_metric="mse",
+        disp_metrics=True,
+    disp_scale=DEFAULT_DISP_SCALE,
     ):
         super().__init__()
         self.channels = channels
@@ -750,6 +860,36 @@ class GaussianDiffusion(nn.Module):
         self.num_frames = num_frames
         self.denoise_fn = denoise_fn
         self.contour_noise_only = contour_noise_only
+
+        # Displacement normalization divisor; see DEFAULT_DISP_SCALE. Validated
+        # here rather than at first use so a bad value fails at construction, not
+        # thousands of steps in. Rejecting 0 matters most: it would silently make
+        # every normalized displacement inf/nan.
+        disp_scale = float(disp_scale)
+        if not math.isfinite(disp_scale) or disp_scale <= 0:
+            raise ValueError(f"disp_scale must be a finite positive number, got {disp_scale!r}")
+        self.disp_scale = disp_scale
+
+        # Which motion-normalized displacement ratio p_losses reports: "mse",
+        # "epe", or None for no ratio. This is a REPORTING choice only -- the
+        # score normalizer gt_disp_msq comes back regardless, because Group-DRO
+        # consumes it and the objective must not depend on a logging flag.
+        # See `displacement_roi_metrics`.
+        if disp_rel_metric not in (None, "mse", "epe"):
+            raise ValueError(
+                f"unknown disp_rel_metric {disp_rel_metric!r}, expected 'mse', 'epe' or None"
+            )
+        self.disp_rel_metric = disp_rel_metric
+
+        # Master switch for the whole ROI-metrics block in p_losses, INCLUDING
+        # gt_disp_msq (which disp_rel_metric=None still computes). False restores
+        # the pre-score-normalize behaviour exactly: nothing extra is computed and
+        # the 5th return value stays an empty dict, so the logs carry only `loss`
+        # and `disp_recon_mse`. Use it to reproduce a run from before these
+        # metrics existed. The metrics are diagnostics under no_grad, so this
+        # changes what is LOGGED and a little compute -- never the gradients, and
+        # never the trained weights.
+        self.disp_metrics = bool(disp_metrics)
 
         betas = cosine_beta_schedule(timesteps)
 
@@ -910,7 +1050,7 @@ class GaussianDiffusion(nn.Module):
                 img, torch.full((b,), i, device=device, dtype=torch.long), cond=cond, cond_scale=cond_scale, noise_mask=noise_mask
             )
 
-        return unnormalize_divide_by_5(img)
+        return unnormalize_disp(img, self.disp_scale)
 
     def ddim_timestep_pairs(self, ddim_steps, spacing="uniform", start_t=None):
         """(t, t_prev) pairs for a DDIM subsequence of the full training chain,
@@ -1056,7 +1196,7 @@ class GaussianDiffusion(nn.Module):
             if noise_mask is not None:
                 img = img * noise_mask
 
-        return unnormalize_divide_by_5(img)
+        return unnormalize_disp(img, self.disp_scale)
 
     @torch.inference_mode()
     def sample(self, cond=None, cond_scale=1.0, batch_size=16, sampler="ddpm", ddim_steps=50,
@@ -1132,10 +1272,23 @@ class GaussianDiffusion(nn.Module):
         if valid_frames is not None:
             frame_mask = build_frame_mask(valid_frames, f, device=device, dtype=x_start.dtype)
 
+        # Contour ROI from the CONTOUR condition's first frame, [B, 1, F, H, W].
+        # cond[1] (motion) is deliberately not consulted: the ROI must mean the
+        # same thing as in the contour-only lineage for the metrics below to be
+        # comparable across the two. Its two consumers are independent:
+        # contour_noise_only decides whether the LOSS is masked, while the
+        # displacement metrics below are always scored over the myocardium only
+        # (over the whole frame their denominator would be mostly background
+        # zeros -- same region StrainAnalysis scores over). So build it when
+        # EITHER wants it, and skip the work when neither does.
+        roi_mask = None
+        if (self.contour_noise_only or self.disp_metrics) and cond is not None and isinstance(cond[0], torch.Tensor):
+            roi_mask = extract_noise_mask_from_first_frame(cond[0])
+
         # When contour_noise_only is enabled, mask noise using first frame of contour mask
         noise_mask = None
-        if self.contour_noise_only and cond is not None and isinstance(cond[0], torch.Tensor):
-            noise_mask = extract_noise_mask_from_first_frame(cond[0])  # [B, 1, F, H, W]
+        if self.contour_noise_only and roi_mask is not None:
+            noise_mask = roi_mask  # [B, 1, F, H, W]
             noise = noise * noise_mask  # broadcasts to [B, 2, F, H, W]
 
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
@@ -1167,6 +1320,20 @@ class GaussianDiffusion(nn.Module):
             disp_recon_mse = torch.mean((x_start - x0) ** 2)
         else:
             disp_recon_mse = ((x_start - x0) ** 2 * frame_mask).sum() / frame_mask.expand_as(x_start).sum().clamp(min=1.0)
+
+        # Motion-normalized displacement metrics over the contour ROI (and, when
+        # given, the valid frames only). Diagnostics plus the Group-DRO score
+        # normalizer -- never part of the gradient, hence no_grad: it keeps the
+        # extra activations out of the graph and the sqrt(0) derivative out of
+        # the backward pass.
+        # Skipped entirely when disp_metrics is off, leaving the dict empty.
+        disp_metrics = {}
+        if self.disp_metrics and roi_mask is not None:
+            with torch.no_grad():
+                region = roi_mask if frame_mask is None else roi_mask * frame_mask
+                disp_metrics = displacement_roi_metrics(
+                    x0, x_start, region, form=self.disp_rel_metric
+                )
 
         if self.contour_noise_only and noise_mask is not None:
             # Compute loss only in the contour region
@@ -1211,8 +1378,16 @@ class GaussianDiffusion(nn.Module):
                 denom = frame_mask.expand_as(per_element).sum().clamp(min=1.0)
                 loss = (per_element * frame_mask).sum() / denom
 
-        return loss, unnormalize_divide_by_5(x0), unnormalize_divide_by_5(x_start), disp_recon_mse
-        
+        # 5th element is a dict so the next diagnostic does not change the arity
+        # again. Empty when there is no contour condition to build an ROI from.
+        return (
+            loss,
+            unnormalize_disp(x0, self.disp_scale),
+            unnormalize_disp(x_start, self.disp_scale),
+            disp_recon_mse,
+            disp_metrics,
+        )
+
     def forward(self, x, cond=None, *args, valid_frames=None, **kwargs):
         # cond type: [contour_cond_video, motion_cond_video]
         (
@@ -1227,9 +1402,9 @@ class GaussianDiffusion(nn.Module):
         check_shape(x, "b c f h w", c=self.channels, f=self.num_frames, h=img_size, w=img_size)
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
-        x = normalize_divide_by_5(x)
+        x = normalize_disp(x, self.disp_scale)
         contour_cond_video = normalize_cond_img(cond[0])
-        motion_cond_video = normalize_divide_by_5(cond[1])
+        motion_cond_video = normalize_disp(cond[1], self.disp_scale)
         return self.p_losses(x, t, cond=[contour_cond_video, motion_cond_video], valid_frames=valid_frames, **kwargs)
     
     
@@ -1248,12 +1423,12 @@ class GaussianDiffusion(nn.Module):
 
         Args:
             x_start: Tensor of shape (C, F, H, W) or (1, C, F, H, W) in your *unnormalized* scale
-                    (i.e., pre normalize_divide_by_5). If normalize_input=False, it is assumed
+                    (i.e., pre normalize_disp). If normalize_input=False, it is assumed
                     already normalized like in `forward()`.
             t:       Integer timestep in [0, self.num_timesteps-1] or a 0/1-D tensor.
             noise:   Optional noise tensor of same shape as x_start (after adding batch dim).
                     If None, uses standard Gaussian.
-            normalize_input: If True, applies `normalize_divide_by_5` to x_start before diffusion.
+            normalize_input: If True, applies `normalize_disp` to x_start before diffusion.
             return_noise: If True, also returns the noise actually used.
 
         Returns:
@@ -1271,7 +1446,7 @@ class GaussianDiffusion(nn.Module):
 
         # match normalization used in training
         if normalize_input:
-            x_start = normalize_divide_by_5(x_start)
+            x_start = normalize_disp(x_start, self.disp_scale)
 
         # timestep as a (1,) long tensor on correct device
         if isinstance(t, int):
@@ -1292,7 +1467,7 @@ class GaussianDiffusion(nn.Module):
 
         # return in normalized space (like q_sample outputs).
         # If you prefer to get it back in the original scale, uncomment:
-        # x_t = unnormalize_divide_by_5(x_t)
+        # x_t = unnormalize_disp(x_t, self.disp_scale)
 
         return (x_t, noise) if return_noise else x_t
 
@@ -1304,12 +1479,32 @@ def identity(t, *args, **kwargs):
     return t
 
 
-def normalize_divide_by_5(x: torch.Tensor) -> torch.Tensor:
-    return x / 5.0
+# Displacement fields are divided by this before diffusion and multiplied back
+# after. 5.0 is the historical value, hardcoded until it became configurable via
+# `diffusion.disp_scale`; EVERY checkpoint trained before then assumes it, which
+# is why it stays the default and why the trainers record the scale they used
+# into the checkpoint and refuse to load it back under a different one.
+#
+# It is a pure change of units on x0, so it rescales nothing that is
+# dimensionless -- the disp_rel ratios and DRO's r_g are unaffected -- but it
+# does move the eps-prediction loss, whose floor scales with Var[x0], by
+# (5/scale)^2. Loss curves are therefore NOT comparable across scales.
+DEFAULT_DISP_SCALE = 5.0
 
 
-def unnormalize_divide_by_5(x: torch.Tensor) -> torch.Tensor:
-    return x * 5.0
+def normalize_disp(x: torch.Tensor, scale: float = DEFAULT_DISP_SCALE) -> torch.Tensor:
+    return x / scale
+
+
+def unnormalize_disp(x: torch.Tensor, scale: float = DEFAULT_DISP_SCALE) -> torch.Tensor:
+    return x * scale
+
+
+# Legacy names. Kept so anything still importing them keeps working at the
+# historical 5.0; new code calls normalize_disp/unnormalize_disp with an
+# explicit scale.
+normalize_divide_by_5 = normalize_disp
+unnormalize_divide_by_5 = unnormalize_disp
 
 
 def normalize_channelwise(x: torch.Tensor) -> torch.Tensor:
@@ -1652,6 +1847,8 @@ class Trainer(object):
             "ema": self.ema_model.state_dict(),
             "scaler": self.scaler.state_dict(),
         }
+        # Units the weights are in, not a hyperparameter -- see checkpoint_compat.
+        record_disp_scale(data, self.model)
         torch.save(data, str(self.checkpoints_folder / f"model-{milestone}.pt"))
 
     def load(self, milestone, **kwargs):
@@ -1672,6 +1869,9 @@ class Trainer(object):
             data = torch.load(ckpt_path)
 
         print(f"loaded checkpoint: model-{milestone}.pt\n")
+
+        # Before any weights land: refuse a checkpoint trained in other units.
+        verify_disp_scale(data, self.model, milestone)
 
         self.step = data["step"]
         self.model.load_state_dict(data["model"], **kwargs)
@@ -1709,7 +1909,7 @@ class Trainer(object):
                 valid_frames = valid_frames.cuda() if self.use_frame_validity else None
 
                 with autocast(enabled=self.amp):
-                    loss, x0, x_start, disp_recon_mse = self.model(
+                    loss, x0, x_start, disp_recon_mse, disp_metrics = self.model(
                         input_video,
                         cond=[contour_cond_video, motion_cond_video],
                         valid_frames=valid_frames,
@@ -1719,10 +1919,15 @@ class Trainer(object):
 
                     self.scaler.scale(loss / self.gradient_accumulate_every).backward()
 
+                # Drop any metric whose batch had no usable motion normalizer,
+                # before it can reach a log line or a running sum.
+                disp_items = finite_metric_items(disp_metrics)
+                disp_parts = "".join(f" | {k}: {v}" for k, v in sorted(disp_items.items()))
+
                 # Route through the bar's writer so per-step loss lines scroll above
                 # the pinned epoch progress bar instead of fighting it.
                 epoch_bar.write(
-                    f"{self.step}: {loss.item()} | disp_recon_mse: {disp_recon_mse.item()}"
+                    f"{self.step}: {loss.item()} | disp_recon_mse: {disp_recon_mse.item()}{disp_parts}"
                 )
 
             # Accumulate the true cumulative mean of the loss since the start.
@@ -1734,6 +1939,7 @@ class Trainer(object):
                 "loss_cummean": self._loss_sum / self._loss_count,
                 "disp_recon_mse": disp_recon_mse.item(),
                 "step": self.step,
+                **disp_items,
             }
 
             # Accumulate the epoch loss / disp_recon_mse and advance the epoch bar.
@@ -1798,7 +2004,7 @@ class Trainer(object):
                 )
                 # normalize cine contour condition image here
                 sample_contour_cond = normalize_cond_img(sample_contour_cond)
-                sample_motion_cond = normalize_divide_by_5(sample_motion_cond)
+                sample_motion_cond = normalize_disp(sample_motion_cond, self.model.disp_scale)
 
                 # If your training set is on CPU, move to GPU:
                 device = next(self.ema_model.parameters()).device

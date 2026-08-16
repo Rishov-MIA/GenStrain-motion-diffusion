@@ -25,6 +25,7 @@ from tqdm import tqdm
 from video_diffusion_pytorch.config_snapshot import save_config_snapshot
 from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_only import (
     GaussianDiffusion,
+    normalize_disp,
     Trainer,
     Unet3D,
 )
@@ -78,10 +79,6 @@ def parse_args():
     parser.add_argument('--no_config_snapshot', action='store_true',
                         help='skip writing the config snapshot (set by the multi-GPU launcher on all but one worker to avoid a concurrent-write race)')
     return parser.parse_args()
-
-
-def normalize_divide_by_5(x: torch.Tensor) -> torch.Tensor:
-    return x / 5.0
 
 
 def pick_condition_videos_one_video_at_once(motion_cond_video_dir, start, end):
@@ -160,6 +157,7 @@ def main():
         num_frames=diffusion_cfg["num_frames"],
         timesteps=diffusion_cfg["timesteps"],
         loss_type=diffusion_cfg["loss_type"],
+        disp_scale=diffusion_cfg.get("disp_scale", 5.0),
     ).cuda()
 
     base_path = Path(data_cfg["base_path"])
@@ -193,7 +191,7 @@ def main():
     os.makedirs(custom_save_folder, exist_ok=True)
 
     for motion_cond_video, cond_filename in tqdm(video_generator, total=total_videos, desc="videos", unit="video", position=0):
-        motion_cond_video = normalize_divide_by_5(motion_cond_video).to(device)
+        motion_cond_video = normalize_disp(motion_cond_video, diffusion.disp_scale).to(device)
 
         # Generate samples
         if video_type == "cine":

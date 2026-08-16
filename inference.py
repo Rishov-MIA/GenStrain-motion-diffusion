@@ -156,6 +156,7 @@ def main():
         timesteps=diffusion_cfg["timesteps"],
         loss_type=diffusion_cfg["loss_type"],
         contour_noise_only=diffusion_cfg["contour_noise_only"],
+        disp_scale=diffusion_cfg.get("disp_scale", 5.0),
     ).cuda()
 
     base_path = Path(data_cfg["base_path"])

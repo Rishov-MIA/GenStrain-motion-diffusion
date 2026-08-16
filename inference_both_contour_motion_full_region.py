@@ -26,6 +26,7 @@ from tqdm import tqdm
 from video_diffusion_pytorch.config_snapshot import save_config_snapshot
 from video_diffusion_pytorch.video_diffusion_cross_attention_with_both_contour_motion import (
     GaussianDiffusion,
+    normalize_disp,
     Trainer,
     Unet3D,
 )
@@ -83,10 +84,6 @@ def parse_args():
 
 def normalize_cond_img(t):
     return t / 255.0
-
-
-def normalize_divide_by_5(x: torch.Tensor) -> torch.Tensor:
-    return x / 5.0
 
 
 def pick_condition_videos_one_video_at_once(contour_cond_video_dir, motion_cond_video_dir, start, end):
@@ -168,6 +165,7 @@ def main():
         timesteps=diffusion_cfg["timesteps"],
         loss_type=diffusion_cfg["loss_type"],
         contour_noise_only=diffusion_cfg["contour_noise_only"],
+        disp_scale=diffusion_cfg.get("disp_scale", 5.0),
     ).cuda()
 
     base_path = Path(data_cfg["base_path"])
@@ -206,7 +204,7 @@ def main():
 
     for contour_cond_video, motion_cond_video, cond_filename in tqdm(video_generator, total=total_videos, desc="videos", unit="video", position=0):
         contour_cond_video = normalize_cond_img(contour_cond_video).to(device)
-        motion_cond_video = normalize_divide_by_5(motion_cond_video).to(device)
+        motion_cond_video = normalize_disp(motion_cond_video, diffusion.disp_scale).to(device)
 
         # Generate samples
         if video_type == "cine":

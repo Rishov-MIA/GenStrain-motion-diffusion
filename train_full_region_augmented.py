@@ -93,6 +93,8 @@ def main():
         contour_noise_only=diffusion_cfg["contour_noise_only"],
         # Optional: predates most configs, so .get() with the default.
         disp_rel_metric=diffusion_cfg.get("disp_rel_metric", "mse"),
+        disp_metrics=diffusion_cfg.get("disp_metrics", True),
+        disp_scale=diffusion_cfg.get("disp_scale", 5.0),
     ).cuda()
 
     # aug_subdir (e.g. "aug_5x") sits between the dataset root and the split subdirs.

@@ -74,6 +74,8 @@ from video_diffusion_pytorch.trainer_ddp import (
 )
 from video_diffusion_pytorch.frame_validity import load_valid_frames_map
 
+from video_diffusion_pytorch.checkpoint_compat import record_disp_scale, verify_disp_scale
+
 try:
     import wandb
 except ImportError:  # wandb is optional; training works without it
@@ -298,6 +300,8 @@ class InverseFrequencyDDPTrainer(InverseFrequencyTrainer):
             "reweight_group_weights": self.group_weights.detach().cpu(),
             "reweight_weight_decay": self.weight_decay,
         }
+        # Units the weights are in, not a hyperparameter -- see checkpoint_compat.
+        record_disp_scale(ckpt, self.raw_model)
         torch.save(ckpt, str(self.checkpoints_folder / f"model-{milestone}.pt"))
 
     def load(self, milestone, **kwargs):
@@ -315,6 +319,9 @@ class InverseFrequencyDDPTrainer(InverseFrequencyTrainer):
 
         if is_main_process():
             print(f"loaded checkpoint: model-{milestone}.pt\n")
+
+        # Before any weights land: refuse a checkpoint trained in other units.
+        verify_disp_scale(ckpt, self.raw_model, milestone)
 
         self.step = ckpt["step"]
         self.raw_model.load_state_dict(ckpt["model"], **kwargs)

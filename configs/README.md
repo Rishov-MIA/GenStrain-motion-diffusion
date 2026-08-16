@@ -21,6 +21,7 @@ torchrun --standalone --nproc_per_node=4 train_group_dro_ddp.py --config configs
 | `train_full_region_augmented_ddp.json` | `train_full_region_augmented_ddp.py` | full-region noise, contour condition, augmented data (`--aug N`), multi-GPU |
 | `train_both_contour_motion.json` | `train_both_contour_motion.py` | contour-region noise, contour + motion conditions |
 | `train_both_contour_motion_full_region.json` | `train_both_contour_motion_full_region.py` | full-region noise, contour + motion conditions |
+| `train_both_contour_motion_full_region_ddp.json` | `train_both_contour_motion_full_region_ddp.py` | full-region noise, contour + motion conditions, multi-GPU |
 | `train_only_motion.json` | `train_only_motion.py` | motion condition only |
 | `train_group_dro.json` | `train_group_dro.py` | Group-DRO, contour condition |
 | `train_group_dro_ddp.json` | `train_group_dro_ddp.py` | Group-DRO, contour condition, multi-GPU |
@@ -165,11 +166,21 @@ In DDP only rank 0 writes.
   ```bash
   python train_full_region_augmented.py --aug 5
   ```
-- `sampling_base_path` — augmented config only, optional. Dataset root for the
-  sampling condition folder(s), used instead of `base_path`/`aug_subdir`. Set it
+- `sampling_base_path` — optional; read by the DDP, augmented, Group-DRO and
+  inverse-frequency scripts (**not** by the plain single-GPU `train.py`,
+  `train_full_region.py`, `train_both_contour_motion*.py` or
+  `train_only_motion.py`, which always join the `sampling_*_subdir` entries onto
+  `base_path`). Dataset root for the sampling condition folder(s), used instead
+  of `base_path` (or, in the augmented configs, `base_path`/`aug_subdir`). Set it
   when sampling should draw from a separate (e.g. non-augmented) dataset — the
   `sampling_*_subdir` entries are joined onto this path. When absent, sampling
-  falls back to the augmented `data_root` (`base_path`/`aug_subdir`).
+  falls back to the training data root.
+- `motion_condition_subdir` / `sampling_motion_condition_subdir` — the
+  `both_contour_motion` and `only_motion` configs only: the motion-condition
+  (displacement field) folders for training and for preview sampling. The
+  contour and motion folders are paired by **sorted filename order**, so each
+  must hold the same number of `.npy` files under matching names — the Dataset
+  asserts on the count, but a name mismatch would silently mis-pair.
 - `metadata_json_path` — Group-DRO and inverse-frequency only: the processed
   Excel metadata JSON (disease groups).
 - `num_workers` — DataLoader workers (DDP, Group-DRO and inverse-frequency
@@ -186,6 +197,39 @@ In DDP only rank 0 writes.
 - `contour_noise_only` — true = noise only inside the mask contour region,
   false = full image. Not present for `train_only_motion.json` (that model
   has no contour input).
+- `disp_scale` (default **5.0**) — the divisor applied to displacement fields
+  before diffusion, and the multiplier applied to every output afterwards. It was
+  hardcoded to `5.0` until it became configurable, so **every checkpoint trained
+  before then assumes 5.0** — which is why that is the default.
+
+  Unlike the other fields here it describes the *units the weights are in*, not a
+  hyperparameter you can retune on a resume. Changing it means training from
+  scratch: the trainers stamp the scale into each checkpoint and **refuse to load
+  one saved under a different value**, naming both numbers. A checkpoint with no
+  recorded scale is assumed to be 5.0, so existing checkpoints keep loading at the
+  default and fail loudly under anything else. Keep the training config and the
+  matching `inference_*.json` in agreement — inference reads this field too, and
+  a mismatch would rescale every saved displacement field.
+
+  It changes the loss scale: the eps-prediction floor moves with `Var[x0]`, i.e.
+  by `(5/disp_scale)²`, so **loss curves are not comparable across scales**. The
+  dimensionless diagnostics are: `mse_disp_rel`, `epe_disp_rel` and Group-DRO's
+  `r_g` all cancel it, and are the right things to compare between runs.
+- `disp_metrics` (default **true**) — master switch for the ROI displacement
+  metrics block. Not present for `train_only_motion.json`: that model has no
+  contour input, so it has no ROI to score over and computes none of these
+  metrics (neither this field nor `disp_rel_metric` below applies to it). Set it
+  to `false` to **reproduce a run from before these metrics
+  existed**: nothing extra is computed and the logs carry only `loss` and
+  `disp_recon_mse` — not even `gt_disp_msq`, which `disp_rel_metric: null` still
+  emits. The metrics are diagnostics computed under `no_grad`, so this only
+  changes what is logged (and a little compute) — **the gradients and the trained
+  weights are identical either way**, whichever setting you use.
+
+  One interaction, and it fails loudly rather than silently: Group-DRO's
+  `score_normalize` reads `gt_disp_msq` from this block, so setting
+  `disp_metrics: false` alongside `dro.score_normalize: true` raises at startup.
+  To reproduce a pre-normalization DRO run, turn both off.
 - `disp_rel_metric` — which **motion-normalized displacement ratio** to log
   alongside `disp_recon_mse`, scored over the contour ROI only:
   - `"mse"` (default) — `mse_disp_rel` = `mean‖Δu‖² / mean‖u_GT‖²` (normalized
@@ -202,7 +246,12 @@ In DDP only rank 0 writes.
   never compare a run logged under one form against a run logged under the other.
 
   `gt_disp_msq` (mean `‖u_GT‖²` over the ROI) is logged regardless of this
-  setting, because Group-DRO consumes it as the score normalizer below.
+  setting, because Group-DRO consumes it as the score normalizer below. Use
+  `disp_metrics: false` above to suppress that too.
+
+  In the contour **+ motion** configs the ROI is still taken from the contour
+  condition alone — the motion condition never enters it — so these numbers are
+  directly comparable against a contour-only run on the same data.
 
   Note these are single-step estimates of `x0` at a randomly drawn `t`, so the
   per-step value is noisy and much larger than the same metric computed on fully

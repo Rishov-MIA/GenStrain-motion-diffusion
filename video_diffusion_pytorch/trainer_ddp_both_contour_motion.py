@@ -1,28 +1,42 @@
 """
-DistributedDataParallel (DDP) variant of the Trainer for multi-GPU, single-node
-training.
+DistributedDataParallel (DDP) trainer for the BOTH-conditions model (contour
+mask + motion field).
 
-This subclasses the existing single-GPU Trainer in
-`video_diffusion_cross_attention_with_motion_after_only_contour` and overrides
-only the parts that must be DDP-aware:
+This is the two-condition counterpart of `trainer_ddp.DDPTrainer`. The DDP
+mechanics are identical -- what differs is the conditioning:
+
+  * the Dataset yields a 4-tuple (input, contour, motion, valid_frames)
+  * every model call passes `cond=[contour_cond_video, motion_cond_video]`
+  * the periodic preview sample draws a MATCHED contour/motion pair, and the
+    motion condition is normalized with `normalize_disp` (it is a
+    displacement field), not `normalize_cond_img` (which is for the 0-255 mask)
+
+It subclasses the single-GPU `Trainer` from
+`video_diffusion_cross_attention_with_both_contour_motion` and overrides only
+the parts that must be DDP-aware:
 
   * the model is wrapped in DistributedDataParallel
   * the DataLoader uses a DistributedSampler so each rank sees a disjoint shard
   * checkpoint save/load, EMA, sampling, GIF/console logging happen on rank 0 only
   * the underlying (unwrapped) model is used for EMA + checkpointing
 
+The distributed helpers (process-group setup, rank predicates, cross-rank metric
+averaging) are imported from `trainer_ddp` rather than re-derived, so all DDP
+trainers in this package agree on collective semantics.
+
 Launch with torchrun, e.g. (4 GPUs on one node):
 
-    torchrun --standalone --nproc_per_node=4 train_full_region_ddp.py
+    torchrun --standalone --nproc_per_node=4 train_both_contour_motion_full_region_ddp.py
 
 IMPORTANT: with DDP the `train_batch_size` you pass is PER-GPU. The effective
 (global) batch is `train_batch_size * world_size`. Scale the learning rate
 accordingly (a common starting point is linear scaling).
 """
 
-import os
 import copy
 import inspect
+from contextlib import nullcontext
+from pathlib import Path
 
 from tqdm import tqdm
 
@@ -46,17 +60,26 @@ try:
 except ImportError:  # torch < 2.3
     from torch.cuda.amp import autocast, GradScaler
 
-from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_after_only_contour import (
+from video_diffusion_pytorch.video_diffusion_cross_attention_with_both_contour_motion import (
     Trainer,
     DISP_REL_KEYS,
     EMA,
     Dataset,
     cycle,
     exists,
-    finite_metric_items,
     noop,
     normalize_cond_img,
+    normalize_disp,
     random_pick_condition_videos,
+)
+from video_diffusion_pytorch.trainer_ddp import (
+    cleanup_distributed,
+    get_rank,
+    get_world_size,
+    global_metric_items,
+    is_dist,
+    is_main_process,
+    setup_distributed,
 )
 from video_diffusion_pytorch.frame_validity import load_valid_frames_map
 
@@ -68,69 +91,17 @@ except ImportError:  # wandb is optional; training works without it
     wandb = None
 
 
-def is_dist():
-    return torch.distributed.is_available() and torch.distributed.is_initialized()
+# Re-exported so a train script can import setup/teardown from the trainer it
+# actually uses, instead of reaching into trainer_ddp for half its imports.
+__all__ = [
+    "BothCondDDPTrainer",
+    "setup_distributed",
+    "cleanup_distributed",
+    "is_main_process",
+]
 
 
-def get_rank():
-    return torch.distributed.get_rank() if is_dist() else 0
-
-
-def get_world_size():
-    return torch.distributed.get_world_size() if is_dist() else 1
-
-
-def is_main_process():
-    return get_rank() == 0
-
-
-def setup_distributed():
-    """Initialize the process group from torchrun-provided env vars.
-
-    Returns (local_rank, global_rank, world_size, device).
-    """
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
-    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
-        # Pass device_id so collectives (e.g. barrier) know the device and don't
-        # warn about inferring it from the current device. The device_id kwarg was
-        # added in torch 2.3; on older torch (2.0-2.2) fall back to the plain call.
-        if "device_id" in inspect.signature(torch.distributed.init_process_group).parameters:
-            torch.distributed.init_process_group(backend="nccl", device_id=device)
-        else:
-            torch.distributed.init_process_group(backend="nccl")
-    return local_rank, get_rank(), get_world_size(), device
-
-
-def cleanup_distributed():
-    if is_dist():
-        torch.distributed.destroy_process_group()
-
-
-def global_metric_items(metrics, world_size):
-    """{name: float} for a metric dict, averaged across ranks.
-
-    Iterates in SORTED key order: all_reduce is a collective, so every rank must
-    issue the same calls in the same sequence or the job deadlocks. Dict order is
-    identical across ranks in practice, but sorting removes the failure mode.
-
-    A NaN on any rank propagates through the SUM and drops the metric on every
-    rank for that step. That is deliberate: it keeps ranks in agreement, and the
-    alternative (per-rank filtering) would silently desync their running sums.
-    """
-    out = {}
-    for name in sorted(metrics):
-        value = metrics[name].detach().float()
-        if is_dist():
-            value = value.clone()
-            torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
-            value = value / world_size
-        out[name] = value
-    return finite_metric_items(out)
-
-
-class DDPTrainer(Trainer):
+class BothCondDDPTrainer(Trainer):
     def __init__(self, diffusion_model, input_video_folder, *, local_rank=0, **kwargs):
         # We need to customize DataLoader / model wrapping, so we deliberately do
         # NOT call super().__init__ (it builds a non-distributed DataLoader and
@@ -145,7 +116,10 @@ class DDPTrainer(Trainer):
         # EMA is maintained from the *unwrapped* model on rank 0 only.
         self.ema_model = copy.deepcopy(self.model)
         self.update_ema_every = kwargs.get("update_ema_every", 10)
+        # Both sampling dirs are needed: the preview sample conditions on a
+        # matched (contour, motion) pair, paired by sorted filename order.
         self.sampling_contour_condition_video_dir = kwargs.get("sampling_contour_condition_video_dir")
+        self.sampling_motion_condition_video_dir = kwargs.get("sampling_motion_condition_video_dir")
 
         self.step_start_ema = kwargs.get("step_start_ema", 2000)
         self.save_and_sample_every = kwargs.get("save_and_sample_every", 1000)
@@ -162,6 +136,7 @@ class DDPTrainer(Trainer):
 
         inference_only = kwargs.get("inference_only", False)
         contour_condition_video_dir = kwargs.get("contour_condition_video_dir")
+        motion_condition_video_dir = kwargs.get("motion_condition_video_dir")
         train_lr = kwargs.get("train_lr", 1e-4)
 
         # Optional per-sample valid-frame masking. Empty map (no CSV) => masking
@@ -178,6 +153,7 @@ class DDPTrainer(Trainer):
                 input_video_folder,
                 image_size,
                 contour_condition_video_dir,
+                motion_condition_video_dir,
                 channels=channels,
                 num_frames=num_frames,
                 valid_frames_map=self.valid_frames_map,
@@ -250,7 +226,7 @@ class DDPTrainer(Trainer):
                 wandb.define_metric(f"epoch_{name}", step_metric="epoch")
 
         # True cumulative mean-since-start of the training loss (rank 0 uses the
-        # local loss, matching the console print). Not checkpointed.
+        # global loss, matching the console print). Not checkpointed.
         self._loss_sum = 0.0
         self._loss_count = 0
 
@@ -275,8 +251,6 @@ class DDPTrainer(Trainer):
         # so _epoch_step_count would be the wrong denominator.
         self._epoch_disp_sums = {}
         self._epoch_disp_counts = {}
-
-        from pathlib import Path
 
         checkpoints_folder = f"./{self.experiment_name}/checkpoints"
         self.checkpoints_folder = Path(checkpoints_folder)
@@ -320,8 +294,6 @@ class DDPTrainer(Trainer):
         torch.save(ckpt, str(self.checkpoints_folder / f"model-{milestone}.pt"))
 
     def load(self, milestone, **kwargs):
-        from pathlib import Path
-
         if milestone == -1:
             all_milestones = [int(p.stem.split("-")[-1]) for p in Path(self.checkpoints_folder).glob("**/*.pt")]
             assert len(all_milestones) > 0, "need at least one milestone to load from (milestone == -1)"
@@ -394,9 +366,10 @@ class DDPTrainer(Trainer):
                 self.sampler.set_epoch(self.step)
 
             for i in range(self.gradient_accumulate_every):
-                input_video, contour_cond_video, valid_frames = next(self.dl)
+                input_video, contour_cond_video, motion_cond_video, valid_frames = next(self.dl)
                 input_video = input_video.to(self.device, non_blocking=True)
                 contour_cond_video = contour_cond_video.to(self.device, non_blocking=True)
+                motion_cond_video = motion_cond_video.to(self.device, non_blocking=True)
                 valid_frames = valid_frames.to(self.device, non_blocking=True) if self.use_frame_validity else None
 
                 # Only sync gradients on the last accumulation micro-step.
@@ -404,14 +377,14 @@ class DDPTrainer(Trainer):
                 sync_ctx = (
                     self.ddp_model.no_sync()
                     if (isinstance(self.ddp_model, DDP) and not is_last_micro)
-                    else _nullcontext()
+                    else nullcontext()
                 )
 
                 with sync_ctx:
                     with autocast(enabled=self.amp):
                         loss, _, _, disp_recon_mse, disp_metrics = self.ddp_model(
                             input_video,
-                            cond=[contour_cond_video],
+                            cond=[contour_cond_video, motion_cond_video],
                             valid_frames=valid_frames,
                             prob_focus_present=prob_focus_present,
                             focus_present_mask=focus_present_mask,
@@ -439,9 +412,9 @@ class DDPTrainer(Trainer):
             disp_items = global_metric_items(disp_metrics, self.world_size)
 
             # Per-step loss line. Print/log the GLOBAL (all-rank averaged) loss so
-            # it reflects the full effective batch, not just rank 0's shard —
-            # consistent with the Group-DRO DDP trainer. Route through the bar's
-            # writer so it scrolls above the pinned epoch progress bar.
+            # it reflects the full effective batch, not just rank 0's shard.
+            # Route through the bar's writer so it scrolls above the pinned epoch
+            # progress bar.
             if is_main_process():
                 disp_parts = "".join(f" | {k}: {v}" for k, v in sorted(disp_items.items()))
                 epoch_bar.write(
@@ -518,19 +491,33 @@ class DDPTrainer(Trainer):
             if is_main_process():
                 if self.step != 0 and self.step % self.save_and_sample_every == 0:
                     milestone = self.step // self.save_and_sample_every
+
                     self.save(milestone)
 
-                    sample_contour_cond, sample_cond_filenames = random_pick_condition_videos(
+                    (
+                        sample_contour_cond,
+                        sample_motion_cond,
+                        sample_cond_filenames,
+                    ) = random_pick_condition_videos(
                         num_samples=1,
                         contour_cond_video_dir=self.sampling_contour_condition_video_dir,
+                        motion_cond_video_dir=self.sampling_motion_condition_video_dir,
                     )
+                    # The two conditions are normalized DIFFERENTLY: the contour is
+                    # a 0-255 mask (/255), the motion is a displacement field
+                    # (/disp_scale), matching what GaussianDiffusion.forward does
+                    # during training.
                     sample_contour_cond = normalize_cond_img(sample_contour_cond)
+                    sample_motion_cond = normalize_disp(sample_motion_cond, self.raw_model.disp_scale)
+
                     device = next(self.ema_model.parameters()).device
                     sample_contour_cond = sample_contour_cond.to(device)
+                    sample_motion_cond = sample_motion_cond.to(device)
 
                     self.sample_and_save(
                         milestone,
                         contour_cond_video=sample_contour_cond,
+                        motion_cond_video=sample_motion_cond,
                         cond_filenames=sample_cond_filenames,
                         save_folder=f"./{self.experiment_name}/sampled_videos_infos",
                         sampler=self.preview_sampler,
@@ -560,11 +547,3 @@ class DDPTrainer(Trainer):
 
         if is_main_process():
             print("training completed")
-
-
-class _nullcontext:
-    def __enter__(self):
-        return None
-
-    def __exit__(self, *exc):
-        return False

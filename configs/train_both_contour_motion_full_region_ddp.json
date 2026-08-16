@@ -1,12 +1,13 @@
 {
-    "experiment_name": "proposal-26frames-mask-only-aug_{aug}x-ddp-lbbb-healthy",
+    "experiment_name": "new-data-noise-full-region-cond-mask-motion-both-ddp",
     "data": {
-        "base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames_augmented_by_disease_ratio",
-        "aug_subdir": "aug_{aug}x",
+        "base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames",
         "input_video_subdir": "dense/train/displacement_dense",
         "contour_condition_subdir": "dense/train/dense_mask",
-        "sampling_base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames_by_disease_ratio_80_20",
+        "motion_condition_subdir": "tlrn_dense_mask_motion/train",
+        "sampling_base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames",
         "sampling_contour_condition_subdir": "dense/test/dense_mask",
+        "sampling_motion_condition_subdir": "tlrn_dense_mask_motion/test",
         "num_workers": 4
     },
     "model": {
@@ -32,13 +33,13 @@
         "disp_rel_metric": "mse"
     },
     "training": {
-        "per_gpu_batch_size": 8,
-        "lr": 2e-05,
+        "per_gpu_batch_size": 4,
+        "lr": 1e-05,
         "num_steps": 700000,
         "gradient_accumulate_every": 1,
         "ema_decay": 0.995,
         "amp": true,
-        "save_and_sample_every": 300,
+        "save_and_sample_every": 500,
         "preview_sampler": "ddpm",
         "preview_ddim_steps": 50,
         "preview_ddim_eta": 0.0,
@@ -48,12 +49,11 @@
         "resume": true
     },
     "logging": {
-        "use_wandb": true,
+        "use_wandb": false,
         "wandb_project": "genstrain-motion-diffusion"
     },
     "frame_validity": {
-        "_comment": "set csv_path to this dataset's frame-counts CSV to mask padding frames in the loss; null = off (all frames)",
-        "csv_path": null,
+        "csv_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames/frame_counts_train.csv",
         "filename_col": "dense_filename",
         "valid_frames_col": "dense_valid_frames",
         "missing": "error"

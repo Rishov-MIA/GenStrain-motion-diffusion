@@ -28,6 +28,8 @@ from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_after_o
 )
 from video_diffusion_pytorch.frame_validity import load_valid_frames_map, resolve_valid_frames
 
+from video_diffusion_pytorch.checkpoint_compat import record_disp_scale, verify_disp_scale
+
 try:
     import wandb
 except ImportError:  # wandb is optional; training works without it
@@ -324,6 +326,17 @@ class GroupDROTrainer(Trainer):
         self.dro_adjustment_c = float(dro_adjustment_c)
         self.dro_freeze_q = bool(dro_freeze_q)
         self.dro_score_normalize = bool(dro_score_normalize)
+        # The normalizer r_g is derived from gt_disp_msq, which p_losses only emits
+        # while diffusion.disp_metrics is on. With it off the metric dict is empty
+        # and motion_scale would fall back to r_g = 1.0 on every step -- plain DRO
+        # wearing a "normalized" label, and nothing in the logs to say so. Refuse
+        # the combination instead.
+        if self.dro_score_normalize and not getattr(diffusion_model, "disp_metrics", True):
+            raise ValueError(
+                "dro.score_normalize is on but diffusion.disp_metrics is off, so the "
+                "score normalizer (gt_disp_msq) would never be computed. Set "
+                "diffusion.disp_metrics to true, or dro.score_normalize to false."
+            )
         self.weight_decay = float(weight_decay)
         self.num_workers = int(num_workers)
         # Disease groups come strictly from the config (dro.allowed_disease_groups);
@@ -483,6 +496,8 @@ class GroupDROTrainer(Trainer):
             # re-warming them (and briefly mis-normalizing the score) each restart.
             "dro_group_msq": self.dro_group_msq.detach().cpu(),
         }
+        # Units the weights are in, not a hyperparameter -- see checkpoint_compat.
+        record_disp_scale(ckpt, self.model)
         torch.save(ckpt, str(self.checkpoints_folder / f"model-{milestone}.pt"))
 
     def load(self, milestone, **kwargs):
@@ -498,6 +513,9 @@ class GroupDROTrainer(Trainer):
             ckpt = torch.load(ckpt_path, map_location=self.device)
 
         print(f"loaded checkpoint: model-{milestone}.pt\n")
+
+        # Before any weights land: refuse a checkpoint trained in other units.
+        verify_disp_scale(ckpt, self.model, milestone)
 
         self.step = ckpt["step"]
         self.model.load_state_dict(ckpt["model"], **kwargs)

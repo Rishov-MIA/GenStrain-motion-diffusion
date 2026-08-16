@@ -63,6 +63,7 @@ def main():
         num_frames=diffusion_cfg["num_frames"],
         timesteps=diffusion_cfg["timesteps"],
         loss_type=diffusion_cfg["loss_type"],
+        disp_scale=diffusion_cfg.get("disp_scale", 5.0),
     ).cuda()
 
     base_path = Path(data_cfg["base_path"])

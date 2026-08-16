@@ -82,6 +82,8 @@ from video_diffusion_pytorch.trainer_group_dro import (
 from video_diffusion_pytorch.trainer_ddp import global_metric_items
 from video_diffusion_pytorch.frame_validity import load_valid_frames_map
 
+from video_diffusion_pytorch.checkpoint_compat import record_disp_scale, verify_disp_scale
+
 try:
     import wandb
 except ImportError:  # wandb is optional; training works without it
@@ -175,6 +177,18 @@ class GroupDRODDPTrainer(GroupDROTrainer):
         # GroupDROTrainer.motion_scale. Acts on the GLOBAL group loss, so like
         # eta_q it needs no rescaling by world size.
         self.dro_score_normalize = bool(kwargs.get("dro_score_normalize", True))
+        # The normalizer r_g is derived from gt_disp_msq, which p_losses only emits
+        # while diffusion.disp_metrics is on. With it off the metric dict is empty
+        # and motion_scale would fall back to r_g = 1.0 on every step -- plain DRO
+        # wearing a "normalized" label, and nothing in the logs to say so. Refuse
+        # the combination instead. Raised on every rank (all read the same config),
+        # so the job dies before the process group is used rather than deadlocking.
+        if self.dro_score_normalize and not getattr(diffusion_model, "disp_metrics", True):
+            raise ValueError(
+                "dro.score_normalize is on but diffusion.disp_metrics is off, so the "
+                "score normalizer (gt_disp_msq) would never be computed. Set "
+                "diffusion.disp_metrics to true, or dro.score_normalize to false."
+            )
         self.weight_decay = float(kwargs.get("weight_decay", 0.0))
         self.num_workers = int(kwargs.get("num_workers", 4))
         # Disease groups to keep, in string-match PRIORITY order (first match
@@ -360,6 +374,8 @@ class GroupDRODDPTrainer(GroupDROTrainer):
             # re-warming them (and briefly mis-normalizing the score) each restart.
             "dro_group_msq": self.dro_group_msq.detach().cpu(),
         }
+        # Units the weights are in, not a hyperparameter -- see checkpoint_compat.
+        record_disp_scale(ckpt, self.raw_model)
         torch.save(ckpt, str(self.checkpoints_folder / f"model-{milestone}.pt"))
 
     def load(self, milestone, **kwargs):
@@ -377,6 +393,9 @@ class GroupDRODDPTrainer(GroupDROTrainer):
 
         if is_main_process():
             print(f"loaded checkpoint: model-{milestone}.pt\n")
+
+        # Before any weights land: refuse a checkpoint trained in other units.
+        verify_disp_scale(ckpt, self.raw_model, milestone)
 
         self.step = ckpt["step"]
         self.raw_model.load_state_dict(ckpt["model"], **kwargs)

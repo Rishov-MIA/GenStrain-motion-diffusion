@@ -1,61 +1,51 @@
-"""Multi-GPU (single-node) DDP version of train_full_region_augmented.py.
+"""
+Multi-GPU (single-node) DDP version of train_both_contour_motion_full_region.py.
 
-Full-region-noise training on augmented data, conditioned on the contour mask
-only, run across multiple GPUs with torchrun. The dataset lives under an
-augmentation-count folder (aug_1x, aug_2x, ... aug_10x); pass the count with
---aug and it is joined onto base_path via the config's `aug_subdir` template and
-substituted for any "{aug}" placeholders in the config (e.g. experiment_name),
-so nothing on disk is mutated.
+Full-region-noise training conditioned on BOTH the contour mask and the motion
+field. All hyperparameters live in a JSON config (default:
+configs/train_both_contour_motion_full_region_ddp.json); see configs/README.md
+for what each field means. Launch with torchrun. Example for 4 GPUs on one node:
 
-All hyperparameters live in a JSON config (default:
-configs/train_full_region_augmented_ddp.json); see configs/README.md for what
-each field means. Launch with torchrun. Example for 4 GPUs on one node:
-
-    torchrun --standalone --nproc_per_node=4 train_full_region_augmented_ddp.py --aug 10
+    torchrun --standalone --nproc_per_node=4 train_both_contour_motion_full_region_ddp.py
 
 For 2 GPUs, with a custom config:
 
-    torchrun --standalone --nproc_per_node=2 train_full_region_augmented_ddp.py --aug 5 --config configs/my_experiment_ddp.json
-
-With --aug 5 the (training) data root becomes
-    {base_path}/aug_5x/dense/train/displacement_dense   (etc.)
-
-Sampling conditions can come from a separate (non-augmented) dataset root via the
-optional `sampling_base_path` config field; when absent they fall back to the
-augmented data root.
+    torchrun --standalone --nproc_per_node=2 train_both_contour_motion_full_region_ddp.py --config configs/my_experiment_ddp.json
 
 NOTE: `training.per_gpu_batch_size` is PER-GPU. With N GPUs the effective global
-batch size is `per_gpu_batch_size * N`. Adjust `training.lr` if you intentionally
-grow the global batch (linear LR scaling is a reasonable starting point).
+batch size is `per_gpu_batch_size * N`. The single-GPU script used a global batch
+of 16. To keep the same global batch on 4 GPUs, set per_gpu_batch_size = 4; on
+2 GPUs set per_gpu_batch_size = 8. Adjust `training.lr` if you intentionally grow
+the global batch (linear LR scaling is a reasonable starting point).
+
+The contour and motion conditions are paired by SORTED FILENAME ORDER, both in
+the training Dataset and when drawing a preview sample, so the two condition
+directories must contain the same number of .npy files under matching names.
 """
 
 import argparse
 import json
 from pathlib import Path
 
-from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_after_only_contour import (
+from video_diffusion_pytorch.video_diffusion_cross_attention_with_both_contour_motion import (
     Unet3D,
     GaussianDiffusion,
 )
 from video_diffusion_pytorch.config_snapshot import save_config_snapshot
-from video_diffusion_pytorch.trainer_ddp import (
-    DDPTrainer,
+from video_diffusion_pytorch.trainer_ddp_both_contour_motion import (
+    BothCondDDPTrainer,
     setup_distributed,
     cleanup_distributed,
     is_main_process,
 )
 
-DEFAULT_CONFIG = Path(__file__).resolve().parent / "configs" / "train_full_region_augmented_ddp.json"
+DEFAULT_CONFIG = (
+    Path(__file__).resolve().parent / "configs" / "train_both_contour_motion_full_region_ddp.json"
+)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--aug",
-        type=int,
-        required=True,
-        help="augmentation count N, selecting the aug_Nx dataset folder (e.g. 5 -> aug_5x)",
-    )
     parser.add_argument(
         "--config",
         type=Path,
@@ -65,25 +55,10 @@ def parse_args():
     return parser.parse_args()
 
 
-def substitute_aug(value, aug):
-    """Recursively replace the "{aug}" placeholder with `aug` in all string values."""
-    if isinstance(value, str):
-        return value.format(aug=aug)
-    if isinstance(value, dict):
-        return {k: substitute_aug(v, aug) for k, v in value.items()}
-    if isinstance(value, list):
-        return [substitute_aug(v, aug) for v in value]
-    return value
-
-
 def main():
     args = parse_args()
     with args.config.open() as f:
         cfg = json.load(f)
-
-    # Bake the augmentation count into every "{aug}" placeholder in the config
-    # (data paths, experiment_name, ...). Nothing on disk is changed.
-    cfg = substitute_aug(cfg, args.aug)
 
     data_cfg = cfg["data"]
     model_cfg = cfg["model"]
@@ -120,19 +95,24 @@ def main():
         disp_scale=diffusion_cfg.get("disp_scale", 5.0),
     ).to(device)
 
-    # aug_subdir (e.g. "aug_5x") sits between the dataset root and the split subdirs.
-    data_root = Path(data_cfg["base_path"]) / data_cfg["aug_subdir"]
+    base_path = Path(data_cfg["base_path"])
 
-    # Sampling conditions can come from a separate (non-augmented) dataset root.
-    # Falls back to the augmented data_root when sampling_base_path is absent.
-    sampling_root = Path(data_cfg.get("sampling_base_path", str(data_root)))
+    # Sampling conditions can come from a separate dataset root via the optional
+    # sampling_base_path config field. Falls back to base_path when absent.
+    sampling_base_path = Path(data_cfg.get("sampling_base_path", str(base_path)))
 
-    trainer = DDPTrainer(
+    trainer = BothCondDDPTrainer(
         diffusion_model=diffusion,
-        input_video_folder=str(data_root / data_cfg["input_video_subdir"]),
+        input_video_folder=str(base_path / data_cfg["input_video_subdir"]),
         local_rank=local_rank,
-        contour_condition_video_dir=str(data_root / data_cfg["contour_condition_subdir"]),
-        sampling_contour_condition_video_dir=str(sampling_root / data_cfg["sampling_contour_condition_subdir"]),
+        contour_condition_video_dir=str(base_path / data_cfg["contour_condition_subdir"]),
+        motion_condition_video_dir=str(base_path / data_cfg["motion_condition_subdir"]),
+        sampling_contour_condition_video_dir=str(
+            sampling_base_path / data_cfg["sampling_contour_condition_subdir"]
+        ),
+        sampling_motion_condition_video_dir=str(
+            sampling_base_path / data_cfg["sampling_motion_condition_subdir"]
+        ),
         train_batch_size=train_cfg["per_gpu_batch_size"],  # PER-GPU
         train_lr=train_cfg["lr"],
         save_and_sample_every=train_cfg["save_and_sample_every"],
