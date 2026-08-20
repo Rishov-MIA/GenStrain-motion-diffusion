@@ -1,5 +1,5 @@
 {
-    "experiment_name": "new-data-noise-full-region-cond-mask-motion-both-ddp",
+    "experiment_name": "proposal-26-frames-cond-mask-motion-both-ddp-scale-5-step-1000",
     "data": {
         "base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames",
         "input_video_subdir": "dense/train/displacement_dense",
@@ -29,12 +29,12 @@
         "loss_type": "l2",
         "disp_scale": 5.0,
         "contour_noise_only": false,
-        "disp_metrics": true,
+        "disp_metrics": false,
         "disp_rel_metric": "mse"
     },
     "training": {
         "per_gpu_batch_size": 4,
-        "lr": 1e-05,
+        "lr": 2e-05,
         "num_steps": 700000,
         "gradient_accumulate_every": 1,
         "ema_decay": 0.995,
