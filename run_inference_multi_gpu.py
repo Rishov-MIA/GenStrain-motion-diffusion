@@ -12,6 +12,7 @@ No model/config changes and no torchrun: this reuses the existing
 inference_*.py scripts exactly as they run single-GPU.
 
     # auto-detect GPUs, run the default config across all of them
+    python run_inference_multi_gpu.py --script inference_both_contour_motion_full_region.py --config configs/inference_both_contour_motion_full_region.json
     python run_inference_multi_gpu.py --script inference_full_region.py
     python run_inference_multi_gpu.py --script inference_full_region.py --config configs/inference_augmented.json
     python run_inference_multi_gpu.py --script inference_full_region.py --config configs/inference_group_dro.json
