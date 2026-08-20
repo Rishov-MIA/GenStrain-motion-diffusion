@@ -68,6 +68,9 @@ def main():
         disp_rel_metric=diffusion_cfg.get("disp_rel_metric", "mse"),
         disp_metrics=diffusion_cfg.get("disp_metrics", True),
         disp_scale=diffusion_cfg.get("disp_scale", 5.0),
+        loss_disp_normalize=diffusion_cfg.get("loss_disp_normalize", False),
+        loss_disp_norm_bounds=diffusion_cfg.get("loss_disp_norm_bounds", (0.2, 5.0)),
+        loss_disp_norm_ema_decay=diffusion_cfg.get("loss_disp_norm_ema_decay", 0.99),
     ).cuda()
 
     base_path = Path(data_cfg["base_path"])

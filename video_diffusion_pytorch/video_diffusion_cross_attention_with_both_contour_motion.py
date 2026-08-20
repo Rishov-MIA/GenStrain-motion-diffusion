@@ -732,6 +732,39 @@ def _batch_mean(values, valid):
     return values[valid].mean()
 
 
+# Below this, a sample's ground-truth motion over the ROI is treated as
+# unmeasurable: it contributes nothing to the normalizer's running estimate and
+# rides the clamp instead of dividing the loss by ~0. Same threshold the metric
+# ratios use to decide a denominator is unusable.
+DISP_NORM_MSQ_EPS = 1e-6
+
+
+def roi_gt_msq(gt, region):
+    """Per-sample mean ||u_GT||^2 over the ROI, [B].
+
+    THE definition of the motion normalizer, shared by the diagnostic metrics
+    below and by the normalized loss (`loss_disp_normalize`), so the number the
+    loss divides by and the `gt_disp_msq` in the logs can never drift apart.
+
+    Reads only the ground truth -- never the model's x0, never t -- so it is a
+    constant with respect to the parameters (no grad path to cut) and a stable,
+    low-variance statistic that needs no smoothing before it can steer anything.
+
+    float32 throughout, for the same reason as `displacement_roi_metrics`: under
+    AMP the incoming fields can be fp16, and this is a denominator.
+
+    Args:
+        gt:     [B, C, F, H, W] ground-truth displacement field.
+        region: [B, 1, F, H, W] ROI mask, 1 inside. Masking is not optional --
+                over the whole frame the mean is mostly background zeros.
+    """
+    gt = gt.detach().float()
+    roi = region[:, 0].detach().float()           # [B, F, H, W]
+    n_roi = roi.flatten(1).sum(1).clamp(min=1.0)  # [B]
+    sq_gt = (gt ** 2).sum(dim=1)                  # per-pixel ||u_GT||^2
+    return (sq_gt * roi).flatten(1).sum(1) / n_roi
+
+
 def displacement_roi_metrics(pred, gt, region, form=None, eps=1e-6):
     """Motion-normalized displacement error over an ROI, plus its normalizer.
 
@@ -787,8 +820,7 @@ def displacement_roi_metrics(pred, gt, region, form=None, eps=1e-6):
     def roi_mean(values):
         return (values * roi).flatten(1).sum(1) / n_roi  # [B]
 
-    sq_gt = (gt ** 2).sum(dim=1)  # per-pixel ||u_GT||^2, [B, F, H, W]
-    gt_msq = roi_mean(sq_gt)
+    gt_msq = roi_gt_msq(gt, region)  # [B]; one shared definition, see above
 
     metrics = {"gt_disp_msq": _batch_mean(gt_msq, gt_msq > eps)}
     if form is None:
@@ -798,6 +830,7 @@ def displacement_roi_metrics(pred, gt, region, form=None, eps=1e-6):
     if form == "mse":
         err, scale = roi_mean(sq_err), gt_msq
     elif form == "epe":
+        sq_gt = (gt ** 2).sum(dim=1)  # per-pixel ||u_GT||^2, [B, F, H, W]
         err, scale = roi_mean(sq_err.sqrt()), roi_mean(sq_gt.sqrt())
     else:
         raise ValueError(f"unknown disp_rel_metric {form!r}, expected 'mse', 'epe' or None")
@@ -837,6 +870,12 @@ def finite_metric_items(metrics):
 # down the file is a NameError at import time, not a lazy lookup.
 DEFAULT_DISP_SCALE = 5.0
 
+# Defaults for the motion-normalized loss (`loss_disp_normalize`). The bounds cap
+# how far one sample's weight may travel from 1.0 in either direction; the decay
+# is the EMA on its reference. See GaussianDiffusion._disp_norm_weights.
+DEFAULT_DISP_NORM_BOUNDS = (0.2, 5.0)
+DEFAULT_DISP_NORM_EMA_DECAY = 0.99
+
 
 def cosine_beta_schedule(timesteps, s=0.008):
     """
@@ -870,6 +909,9 @@ class GaussianDiffusion(nn.Module):
         disp_rel_metric="mse",
         disp_metrics=True,
     disp_scale=DEFAULT_DISP_SCALE,
+        loss_disp_normalize=False,
+        loss_disp_norm_bounds=DEFAULT_DISP_NORM_BOUNDS,
+        loss_disp_norm_ema_decay=DEFAULT_DISP_NORM_EMA_DECAY,
     ):
         super().__init__()
         self.channels = channels
@@ -907,6 +949,51 @@ class GaussianDiffusion(nn.Module):
         # changes what is LOGGED and a little compute -- never the gradients, and
         # never the trained weights.
         self.disp_metrics = bool(disp_metrics)
+
+        # Motion-normalized LOSS. Off by default, and the default path is left
+        # untouched below, so every existing config trains bit for bit as before.
+        #
+        # The eps-loss a sample can reach scales with the SQUARE of how much its
+        # heart actually moves: eps - eps_hat = -sqrt(a/(1-a)) (x0 - x0_hat), so
+        # Var[x0 | x_t] -- and with it the achievable loss -- carries the
+        # displacement amplitude squared. A hypokinetic case therefore looks
+        # nearly solved next to a vigorous one at equal RELATIVE accuracy, and
+        # contributes proportionally less gradient. This divides each sample's
+        # loss by its own mean ||u_GT||^2 over the contour ROI, which is the
+        # dimensionally right divisor for a squared error (`roi_gt_msq`).
+        #
+        # Unlike the metrics above this IS the objective, so it changes the
+        # gradients and the weights: a run with it on is a different model, not a
+        # differently-logged one. `loss_unnormalized` is logged alongside so the
+        # curve stays readable next to a baseline run.
+        self.loss_disp_normalize = bool(loss_disp_normalize)
+
+        lo, hi = (float(b) for b in loss_disp_norm_bounds)
+        if not math.isfinite(hi) or not 0.0 < lo <= hi:
+            raise ValueError(
+                f"loss_disp_norm_bounds must be finite with 0 < lo <= hi, got "
+                f"{loss_disp_norm_bounds!r}"
+            )
+        self.loss_disp_norm_bounds = (lo, hi)
+
+        decay = float(loss_disp_norm_ema_decay)
+        if not 0.0 <= decay < 1.0:
+            raise ValueError(
+                f"loss_disp_norm_ema_decay must be in [0, 1), got {loss_disp_norm_ema_decay!r}"
+            )
+        self.loss_disp_norm_ema_decay = decay
+
+        # Running reference the per-sample msq is measured against. NaN until the
+        # first batch that contains any motion at all.
+        #
+        # persistent=False deliberately keeps it OUT of state_dict, so checkpoints
+        # stay interchangeable with every other variant of this model in both
+        # directions (a new buffer would make strict load() reject every existing
+        # checkpoint). The trainers carry it in the checkpoint dict instead, the
+        # same way Group-DRO carries its group statistics.
+        self.register_buffer(
+            "loss_disp_norm_ref", torch.tensor(float("nan")), persistent=False
+        )
 
         betas = cosine_beta_schedule(timesteps)
 
@@ -1278,6 +1365,129 @@ class GaussianDiffusion(nn.Module):
             + extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
+    def _disp_norm_weights(self, msq):
+        """Per-sample divisor for the normalized loss, [B]. Updates the reference.
+
+        `w_i = clamp(msq_i / ref, lo, hi)`, with `ref` an EMA of the batch-mean
+        msq over the samples that actually move. Three properties earn their
+        keep, and dropping any one of them breaks the run in a different way:
+
+        * RELATIVE, not raw `1/msq`. mean(w) ~ 1, so the normalized loss keeps
+          the magnitude and range of the plain one: `lr`, `max_grad_norm` and the
+          wandb y-axis all carry over, and the run is readable next to its
+          unnormalized twin. On disp_scale=5 data a raw `1/msq` is a ~25x blow-up
+          of the loss, i.e. of the effective learning rate.
+        * CLAMPED. A motionless sample (or one whose ROI came out empty) would
+          otherwise divide by ~0 and capture the batch gradient outright. At the
+          default bounds a sample is up-weighted at most 5x and down-weighted at
+          most 5x, and the pathological ones simply sit at the bound.
+        * EMA'd rather than this batch's mean. A batch that happens to be full of
+          vigorous hearts must not quietly shrink every sample's weight that
+          step; only the SPREAD within the batch should matter. The statistic
+          reads ground truth only, so the EMA is all the smoothing it needs.
+
+        Under DDP the batch statistic is all-reduced before it enters the EMA, so
+        every rank divides by an identical reference -- a rank-local one would
+        have each rank optimizing a slightly different objective. The collective
+        is a 2-element scalar sum issued by every rank on every micro-step (the
+        code path depends only on config, never on the data), so it cannot
+        desync, and it is independent of DDP's own gradient reduction.
+        """
+        with torch.no_grad():
+            # Samples with no measurable motion say nothing about the scale, so
+            # they update nothing -- but they still GET a weight below; the clamp
+            # is what handles them. Masked-multiply rather than boolean indexing:
+            # indexing here would force a device sync on every micro-step.
+            valid = (msq > DISP_NORM_MSQ_EPS).to(msq.dtype)
+            total = (msq * valid).sum()
+            count = valid.sum()
+
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                stats = torch.stack([total, count])
+                torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+                total, count = stats[0], stats[1]
+
+            if bool(count > 0):
+                batch_mean = total / count
+                prev = self.loss_disp_norm_ref
+                self.loss_disp_norm_ref.copy_(
+                    batch_mean
+                    if bool(torch.isnan(prev))
+                    else self.loss_disp_norm_ema_decay * prev
+                    + (1.0 - self.loss_disp_norm_ema_decay) * batch_mean
+                )
+
+            ref = self.loss_disp_norm_ref
+            # No reference yet (first step, and nothing in it moved): fall back to
+            # the plain loss for this step rather than inventing a scale.
+            if bool(torch.isnan(ref)) or not bool(ref > 0):
+                return torch.ones_like(msq)
+
+            lo, hi = self.loss_disp_norm_bounds
+            return (msq / ref).clamp(min=lo, max=hi)
+
+    def disp_normalized_loss(self, noise, x_recon, x_start, roi_mask, noise_mask, frame_mask):
+        """Motion-normalized eps loss: each sample's error over its own motion.
+
+        Masking mirrors the unnormalized branches in `p_losses` exactly, down to
+        the denominator convention (contour branches divide by PIXELS, the
+        full-region frame-masked branch by elements), so the only intended
+        difference between this and the plain loss is the division by `w`.
+
+        One unintended difference is unavoidable and worth knowing: the reduction
+        is PER SAMPLE and then averaged, where the plain branches pool every
+        element of the batch into a single mean. Clips therefore now count once
+        each instead of in proportion to their ROI size and valid-frame count --
+        which is the same per-patient weighting the normalizer is after, but it
+        shifts the loss slightly even at w == 1.
+
+        Returns:
+            (loss, metrics) -- metrics merge into the dict p_losses returns, so
+            both trainers log them without changing the return arity.
+        """
+        diff = noise - x_recon
+        if self.loss_type == "l1":
+            per_element = diff.abs()
+        elif self.loss_type == "l2":
+            per_element = diff ** 2
+        else:
+            raise NotImplementedError()
+
+        if noise_mask is not None:
+            # Contour region, intersected with the valid frames when given.
+            region = noise_mask if frame_mask is None else noise_mask * frame_mask
+            denom = region.flatten(1).sum(1).clamp(min=1.0)
+        elif frame_mask is not None:
+            # Element count, not frame count: frame_mask is [B, 1, F, 1, 1], so it
+            # has to be expanded before counting -- exactly what the unnormalized
+            # full-region branch does with expand_as. Counting it unexpanded would
+            # divide by F and inflate the loss by C*H*W.
+            region = frame_mask
+            denom = region.expand_as(per_element).flatten(1).sum(1).clamp(min=1.0)
+        else:
+            region = None
+
+        if region is None:
+            per_sample_loss = per_element.flatten(1).mean(1)  # [B]
+        else:
+            per_sample_loss = (per_element * region).flatten(1).sum(1) / denom
+
+        # Ground-truth motion over the SAME region the metrics score -- contour
+        # ROI, valid frames only -- so the divisor here and the gt_disp_msq in the
+        # logs are the same quantity and the logged ratio explains the weight.
+        scoring_region = roi_mask if frame_mask is None else roi_mask * frame_mask
+        w = self._disp_norm_weights(roi_gt_msq(x_start, scoring_region))  # [B], no grad
+
+        loss = (per_sample_loss / w).mean()
+
+        return loss, {
+            # What `loss` would have been at w == 1: the bridge back to every
+            # baseline curve, since `loss` itself is now a different quantity.
+            "loss_unnormalized": per_sample_loss.detach().float().mean(),
+            "disp_norm_weight": w.mean(),
+            "disp_norm_ref": self.loss_disp_norm_ref.detach().clone(),
+        }
+
     def p_losses(self, x_start, t, cond=None, noise=None, valid_frames=None, **kwargs):
         # cond: [contour_cond_video, motion_cond_video]
         b, c, f, h, w, device = *x_start.shape, x_start.device
@@ -1292,14 +1502,17 @@ class GaussianDiffusion(nn.Module):
         # Contour ROI from the CONTOUR condition's first frame, [B, 1, F, H, W].
         # cond[1] (motion) is deliberately not consulted: the ROI must mean the
         # same thing as in the contour-only lineage for the metrics below to be
-        # comparable across the two. Its two consumers are independent:
-        # contour_noise_only decides whether the LOSS is masked, while the
-        # displacement metrics below are always scored over the myocardium only
-        # (over the whole frame their denominator would be mostly background
-        # zeros -- same region StrainAnalysis scores over). So build it when
-        # EITHER wants it, and skip the work when neither does.
+        # comparable across the two. Its three consumers are independent:
+        # contour_noise_only decides whether the LOSS is masked; the displacement
+        # metrics below are always scored over the myocardium only (over the whole
+        # frame their denominator would be mostly background zeros -- same region
+        # StrainAnalysis scores over); and loss_disp_normalize measures each
+        # sample's ground-truth motion over it. So build it when ANY of them wants
+        # it, and skip the work when none does.
         roi_mask = None
-        if (self.contour_noise_only or self.disp_metrics) and cond is not None and isinstance(cond[0], torch.Tensor):
+        if (
+            self.contour_noise_only or self.disp_metrics or self.loss_disp_normalize
+        ) and cond is not None and isinstance(cond[0], torch.Tensor):
             roi_mask = extract_noise_mask_from_first_frame(cond[0])
 
         # When contour_noise_only is enabled, mask noise using first frame of contour mask
@@ -1352,7 +1565,21 @@ class GaussianDiffusion(nn.Module):
                     x0, x_start, region, form=self.disp_rel_metric
                 )
 
-        if self.contour_noise_only and noise_mask is not None:
+        if self.loss_disp_normalize:
+            # Motion-normalized objective. Refuse rather than quietly falling back
+            # to the plain loss: a run whose config says "normalized" must never
+            # train unnormalized because a condition tensor went missing.
+            if roi_mask is None:
+                raise ValueError(
+                    "loss_disp_normalize is on but no contour condition was given, so "
+                    "there is no ROI to measure ground-truth motion over. Pass "
+                    "cond=[contour, motion], or set diffusion.loss_disp_normalize to false."
+                )
+            loss, norm_metrics = self.disp_normalized_loss(
+                noise, x_recon, x_start, roi_mask, noise_mask, frame_mask
+            )
+            disp_metrics.update(norm_metrics)
+        elif self.contour_noise_only and noise_mask is not None:
             # Compute loss only in the contour region
             if frame_mask is None:
                 masked_noise = noise * noise_mask
@@ -1851,6 +2078,14 @@ class Trainer(object):
             "ema": self.ema_model.state_dict(),
             "scaler": self.scaler.state_dict(),
         }
+        # The normalized loss's running reference. Its buffer is deliberately
+        # non-persistent (checkpoints must stay loadable by every other variant of
+        # this model), so it travels here instead. Absent from checkpoints written
+        # before it existed, and meaningless in runs with loss_disp_normalize off.
+        ref = getattr(self.model, "loss_disp_norm_ref", None)
+        if ref is not None:
+            data["loss_disp_norm_ref"] = ref.detach().cpu().clone()
+
         # Units the weights are in, not a hyperparameter -- see checkpoint_compat.
         record_disp_scale(data, self.model)
         torch.save(data, str(self.checkpoints_folder / f"model-{milestone}.pt"))
@@ -1881,6 +2116,15 @@ class Trainer(object):
         self.model.load_state_dict(data["model"], **kwargs)
         self.ema_model.load_state_dict(data["ema"], **kwargs)
         self.scaler.load_state_dict(data["scaler"])
+
+        # Restore the normalized loss's reference when both this checkpoint and
+        # this model have one; otherwise the EMA simply re-warms from the first
+        # batch after the resume, which costs a few hundred steps of slightly
+        # noisier weighting and nothing else.
+        saved_ref = data.get("loss_disp_norm_ref")
+        current_ref = getattr(self.model, "loss_disp_norm_ref", None)
+        if saved_ref is not None and current_ref is not None:
+            current_ref.copy_(saved_ref.to(current_ref.device))
 
     def train(self, prob_focus_present=0.0, focus_present_mask=None, log_fn=noop):
         assert callable(log_fn)

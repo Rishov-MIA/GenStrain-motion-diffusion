@@ -289,6 +289,14 @@ class BothCondDDPTrainer(Trainer):
             "ema": self.ema_model.state_dict(),
             "scaler": self.scaler.state_dict(),
         }
+        # The normalized loss's running reference. Its buffer is deliberately
+        # non-persistent (checkpoints must stay loadable by every other variant of
+        # this model), so it travels here instead. Absent from checkpoints written
+        # before it existed, and meaningless in runs with loss_disp_normalize off.
+        ref = getattr(self.raw_model, "loss_disp_norm_ref", None)
+        if ref is not None:
+            ckpt["loss_disp_norm_ref"] = ref.detach().cpu().clone()
+
         # Units the weights are in, not a hyperparameter -- see checkpoint_compat.
         record_disp_scale(ckpt, self.raw_model)
         torch.save(ckpt, str(self.checkpoints_folder / f"model-{milestone}.pt"))
@@ -320,6 +328,17 @@ class BothCondDDPTrainer(Trainer):
         self.raw_model.load_state_dict(ckpt["model"], **kwargs)
         self.ema_model.load_state_dict(ckpt["ema"], **kwargs)
         self.scaler.load_state_dict(ckpt["scaler"])
+
+        # Restore the normalized loss's reference when both this checkpoint and
+        # this model have one; otherwise the EMA simply re-warms from the first
+        # batch after the resume, which costs a few hundred steps of slightly
+        # noisier weighting and nothing else.
+        # Every rank restores it, so the reference stays identical across ranks
+        # exactly as _disp_norm_weights maintains it.
+        saved_ref = ckpt.get("loss_disp_norm_ref")
+        current_ref = getattr(self.raw_model, "loss_disp_norm_ref", None)
+        if saved_ref is not None and current_ref is not None:
+            current_ref.copy_(saved_ref.to(current_ref.device))
 
     # ---- EMA from the unwrapped model ----
 

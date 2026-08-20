@@ -1,0 +1,65 @@
+{
+    "experiment_name": "new-data-noise-full-region-cond-mask-motion-both-disp-norm",
+    "data": {
+        "base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames",
+        "input_video_subdir": "dense/train/displacement_dense",
+        "contour_condition_subdir": "dense/train/dense_mask",
+        "motion_condition_subdir": "tlrn_dense_mask_motion/train",
+        "sampling_contour_condition_subdir": "dense/test/dense_mask",
+        "sampling_motion_condition_subdir": "tlrn_dense_mask_motion/test"
+    },
+    "model": {
+        "dim": 48,
+        "cond_dim": null,
+        "channels": 2,
+        "dim_mults": [
+            1,
+            2,
+            4,
+            8
+        ]
+    },
+    "diffusion": {
+        "image_size": 64,
+        "num_frames": 26,
+        "channels": 2,
+        "timesteps": 1000,
+        "loss_type": "l2",
+        "disp_scale": 5.0,
+        "contour_noise_only": false,
+        "disp_metrics": true,
+        "disp_rel_metric": "mse",
+        "loss_disp_normalize": true,
+        "loss_disp_norm_bounds": [
+            0.2,
+            5.0
+        ],
+        "loss_disp_norm_ema_decay": 0.99
+    },
+    "training": {
+        "batch_size": 16,
+        "lr": 1e-05,
+        "num_steps": 700000,
+        "gradient_accumulate_every": 1,
+        "ema_decay": 0.995,
+        "amp": true,
+        "save_and_sample_every": 500,
+        "preview_sampler": "ddpm",
+        "preview_ddim_steps": 50,
+        "preview_ddim_eta": 0.0,
+        "preview_ddim_spacing": "uniform",
+        "preview_ddim_clip_x_start": null,
+        "preview_ddim_clip_percentile": 0.995,
+        "resume": false
+    },
+    "logging": {
+        "use_wandb": false,
+        "wandb_project": "genstrain-motion-diffusion"
+    },
+    "frame_validity": {
+        "csv_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames/frame_counts_train.csv",
+        "filename_col": "dense_filename",
+        "valid_frames_col": "dense_valid_frames",
+        "missing": "error"
+    }
+}

@@ -22,6 +22,8 @@ torchrun --standalone --nproc_per_node=4 train_group_dro_ddp.py --config configs
 | `train_both_contour_motion.json` | `train_both_contour_motion.py` | contour-region noise, contour + motion conditions |
 | `train_both_contour_motion_full_region.json` | `train_both_contour_motion_full_region.py` | full-region noise, contour + motion conditions |
 | `train_both_contour_motion_full_region_ddp.json` | `train_both_contour_motion_full_region_ddp.py` | full-region noise, contour + motion conditions, multi-GPU |
+| `train_both_contour_motion_full_region_disp_norm.json` | `train_both_contour_motion_full_region.py` | full-region noise, contour + motion conditions, **motion-normalized loss** (`loss_disp_normalize`) |
+| `train_both_contour_motion_full_region_disp_norm_ddp.json` | `train_both_contour_motion_full_region_ddp.py` | full-region noise, contour + motion conditions, motion-normalized loss, multi-GPU |
 | `train_only_motion.json` | `train_only_motion.py` | motion condition only |
 | `train_group_dro.json` | `train_group_dro.py` | Group-DRO, contour condition |
 | `train_group_dro_ddp.json` | `train_group_dro_ddp.py` | Group-DRO, contour condition, multi-GPU |
@@ -53,6 +55,7 @@ python inference.py --sampler ddim --ddim_steps 50          # few-step sampling,
 | `inference_full_region.json` | `inference_full_region.py` | full-region noise, contour condition |
 | `inference_both_contour_motion.json` | `inference_both_contour_motion.py` | contour-region noise, contour + motion conditions |
 | `inference_both_contour_motion_full_region.json` | `inference_both_contour_motion_full_region.py` | full-region noise, contour + motion conditions |
+| `inference_both_contour_motion_full_region_disp_norm.json` | `inference_both_contour_motion_full_region.py` | samples the motion-normalized-loss checkpoint (same weights shape, different `experiment_name`) |
 | `inference_only_motion.json` | `inference_only_motion.py` | motion condition only |
 
 ### Augmented, Group-DRO and inverse-frequency runs
@@ -257,6 +260,59 @@ In DDP only rank 0 writes.
   per-step value is noisy and much larger than the same metric computed on fully
   sampled outputs. Read the epoch/cumulative curves, and keep the authoritative
   numbers in the StrainAnalysis pipeline.
+- `loss_disp_normalize` (default **false**) — divide each sample's loss by its
+  own ground-truth motion, so a hypokinetic case is not treated as easy merely
+  because its heart barely moves. **Contour + motion configs only** — the other
+  entry scripts do not pass the field.
+
+  Why the eps-loss needs it: `eps − eps_hat = −sqrt(a/(1−a)) · (x0 − x0_hat)`, so
+  the loss a sample can reach carries the displacement amplitude **squared**. Two
+  patients at identical *relative* accuracy therefore log very different losses,
+  and the quieter one contributes proportionally less gradient. The divisor is
+  `mean‖u_GT‖²` over the contour ROI — the same `gt_disp_msq` the metrics above
+  report, from one shared definition — which is the dimensionally right divisor
+  for a squared error.
+
+  What actually divides the loss is the **ratio** `w_i = clamp(msq_i / ref, lo,
+  hi)`, not a raw `1/msq`, where `ref` is an EMA of the batch-mean msq:
+  - `mean(w) ≈ 1`, so the loss keeps its usual magnitude — **`lr`,
+    `max_grad_norm` and the y-axis all carry over** from an unnormalized run. A
+    raw `1/msq` multiplies the loss by ~25 on `disp_scale: 5.0` data, i.e. scales
+    the effective learning rate by the same factor.
+  - The clamp keeps a motionless sample from dividing by ~0 and capturing the
+    batch gradient; at the default bounds nothing moves more than 5x in either
+    direction.
+  - The EMA reference means only the *spread within* a batch matters, not whether
+    that batch happened to draw vigorous hearts.
+
+  Unlike `disp_metrics`, **this is the objective**: gradients and weights differ,
+  so a run with it on is a different model, and its `loss` is a different
+  quantity from a baseline run's. Three extra fields are logged to bridge that:
+  `loss_unnormalized` (what `loss` would be at `w == 1`, comparable to a baseline
+  curve), `disp_norm_weight` (batch-mean `w`) and `disp_norm_ref` (the EMA
+  reference). Compare runs on `mse_disp_rel`, which is dimensionless either way.
+
+  Two smaller consequences worth knowing:
+  - The loss is reduced **per sample and then averaged**, where the plain
+    branches pool every element of the batch into one mean. Clips now count once
+    each rather than in proportion to ROI size and valid-frame count — that is
+    the per-patient weighting the normalization is after, but it shifts the loss
+    slightly even at `w == 1`.
+  - It needs the contour condition to build the ROI, and **raises** if one is
+    missing rather than silently training unnormalized.
+
+  Under DDP the batch statistic is all-reduced before it enters the EMA, so every
+  rank divides by an identical reference. The reference is carried in the
+  checkpoint dict (not `state_dict`), so checkpoints stay loadable by every other
+  variant of this model in both directions; a checkpoint saved before this
+  existed simply re-warms the EMA from the first batch after the resume.
+- `loss_disp_norm_bounds` (default **`[0.2, 5.0]`**) — `[lo, hi]` clamp on `w`.
+  Only read when `loss_disp_normalize` is true. Tighten toward `[1, 1]` for a
+  gentler effect; widen `lo` toward 0 to let near-static samples dominate.
+- `loss_disp_norm_ema_decay` (default **0.99**) — smoothing on the reference,
+  i.e. ~100 steps of memory. Only read when `loss_disp_normalize` is true. `0.0`
+  makes the reference this batch's mean, which adds the batch-to-batch noise of
+  the denominator straight into the effective learning rate.
 
 ### `training`
 - `batch_size` (single GPU) / `per_gpu_batch_size` (DDP). In DDP the
