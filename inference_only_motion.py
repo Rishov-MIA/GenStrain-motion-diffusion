@@ -10,6 +10,11 @@ config's `inference` block but can be overridden on the CLI:
 
     python inference_only_motion.py --video_type dense --start 0 --end 50
 
+--skip_existing resumes an interrupted run: any video whose prediction is
+already in the experiment's inference_disps/ folder is skipped.
+
+    python inference_only_motion.py --skip_existing
+
 See configs/README.md for what each field means.
 """
 
@@ -22,6 +27,11 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from video_diffusion_pytorch.completed_outputs import (
+    completed_output_names,
+    inference_output_dir,
+    select_condition_paths,
+)
 from video_diffusion_pytorch.config_snapshot import save_config_snapshot
 from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_only import (
     GaussianDiffusion,
@@ -31,15 +41,6 @@ from video_diffusion_pytorch.video_diffusion_cross_attention_with_motion_only im
 )
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "configs" / "inference_only_motion.json"
-
-
-def count_condition_videos(cond_video_dir, start, end):
-    """Number of files the sampling loop will process — mirrors the generator's
-    sorted-glob + [start:end] slice — so the progress bar knows its total."""
-    n = len(sorted(Path(cond_video_dir).glob("*.npy")))
-    if end is None:
-        end = n
-    return len(range(n)[start:end])
 
 
 def parse_args():
@@ -76,22 +77,16 @@ def parse_args():
                              'x0 amplification vs ~642x at t=998, so 998 is a good value')
     parser.add_argument('--seed', type=int, default=None,
                         help='seed the initial noise x_T so runs are comparable; omit for random')
+    parser.add_argument('--skip_existing', action='store_true',
+                        help='resume: skip any video whose prediction is already in the experiment\'s '
+                             'inference_disps/ folder (truncated files are re-sampled)')
     parser.add_argument('--no_config_snapshot', action='store_true',
                         help='skip writing the config snapshot (set by the multi-GPU launcher on all but one worker to avoid a concurrent-write race)')
     return parser.parse_args()
 
 
-def pick_condition_videos_one_video_at_once(motion_cond_video_dir, start, end):
-    motion_cond_video_dir = Path(motion_cond_video_dir)
-    motion_cond_video_paths = sorted(list(motion_cond_video_dir.glob("*.npy")))
-
-    if end is None:
-        end = len(motion_cond_video_paths)
-
-    indices = range(len(motion_cond_video_paths))
-
-    for idx in indices[start:end]:
-        motion_cond_video_path = motion_cond_video_paths[idx]
+def pick_condition_videos_one_video_at_once(motion_cond_video_paths):
+    for motion_cond_video_path in motion_cond_video_paths:
         cond_filename = f"{motion_cond_video_path.stem}.npy"
         print(cond_filename)
 
@@ -128,6 +123,7 @@ def main():
     ddim_clip_percentile = (args.ddim_clip_percentile if args.ddim_clip_percentile is not None
                             else infer_cfg.get("ddim_clip_percentile", 0.995))
     seed = args.seed if args.seed is not None else infer_cfg.get("seed", None)
+    skip_existing = args.skip_existing or infer_cfg.get("skip_existing", False)
     ddim_start_t = args.ddim_start_t if args.ddim_start_t is not None else infer_cfg.get("ddim_start_t", None)
     # "none"/null -> no clipping; "dynamic" -> percentile clip; anything else -> a float bound.
     ddim_clip_x_start = (args.ddim_clip_x_start if args.ddim_clip_x_start is not None
@@ -183,8 +179,20 @@ def main():
 
     motion_test_subdir = data_cfg["sampling_motion_condition_subdir"].format(video_type=video_type)
     motion_cond_video_dir = str(base_path / motion_test_subdir)
-    video_generator = pick_condition_videos_one_video_at_once(motion_cond_video_dir, start, end)
-    total_videos = count_condition_videos(motion_cond_video_dir, start, end)
+
+    # --skip_existing: a prediction already sitting in the output folder means an
+    # earlier run finished that video, so drop it from this run's work list.
+    output_dir = inference_output_dir(cfg["experiment_name"], video_type)
+    done_names = completed_output_names(output_dir) if skip_existing else None
+    cond_video_paths = select_condition_paths(motion_cond_video_dir, start, end, done_names)
+    if skip_existing:
+        print(f"skip_existing: {len(done_names)} prediction(s) already in {output_dir}; "
+              f"{len(cond_video_paths)} video(s) left to sample in [{start}, {end})")
+        if not cond_video_paths:
+            return
+
+    video_generator = pick_condition_videos_one_video_at_once(cond_video_paths)
+    total_videos = len(cond_video_paths)
 
     device = next(trainer.ema_model.parameters()).device
     custom_save_folder = f"./{cfg['experiment_name']}/sampling_time_sampled_{video_type}_part_videos_infos/"

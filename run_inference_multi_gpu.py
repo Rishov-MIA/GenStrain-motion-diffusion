@@ -26,6 +26,9 @@ inference_*.py scripts exactly as they run single-GPU.
     # dry run: print the per-GPU commands without launching
     python run_inference_multi_gpu.py --script inference_full_region.py --dry_run
 
+    # resume: only sample the videos with no prediction yet, balanced across GPUs
+    python run_inference_multi_gpu.py --script inference_full_region.py --skip_existing
+
 Each worker script must accept --config/--video_type/--start/--end and slice the
 sorted *.npy condition list by [start:end] — which all inference_*.py do.
 """
@@ -36,6 +39,12 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+
+from video_diffusion_pytorch.completed_outputs import (
+    completed_output_names,
+    inference_output_dir,
+    output_name_for,
+)
 
 # Per-script rule for the directory whose *.npy files are sharded, mirroring how
 # each inference script resolves it from the config + resolved video_type. These
@@ -84,6 +93,9 @@ def parse_args():
                         help="only shard the [start:end) window of the file list (default: whole list)")
     parser.add_argument("--end", type=int, default=None,
                         help="only shard the [start:end) window of the file list (default: through the last file)")
+    parser.add_argument("--skip_existing", action="store_true",
+                        help="resume: ignore videos whose prediction is already in the experiment's "
+                             "inference_disps/ folder, and split only the remaining ones across GPUs")
     parser.add_argument("--python", type=str, default=sys.executable, help="python interpreter for the workers")
     parser.add_argument("--dry_run", action="store_true", help="print the per-GPU commands without launching them")
     return parser.parse_args()
@@ -164,7 +176,8 @@ def main():
             f"(resolved from config {config_path} + video_type={video_type}). "
             f"Check data.base_path / the *_subdir template and that this runs where the data lives."
         )
-    n_files = len(sorted(cond_dir.glob("*.npy")))
+    cond_paths = sorted(cond_dir.glob("*.npy"))
+    n_files = len(cond_paths)
     if n_files == 0:
         raise SystemExit(f"no *.npy condition files in {cond_dir}")
 
@@ -180,7 +193,26 @@ def main():
     if not gpus:
         raise SystemExit("no GPUs to run on")
 
-    shards = even_shards(win_start, win_end, len(gpus))
+    if args.skip_existing:
+        # Balance the *remaining* work, not the raw index range: after a partial run
+        # the finished videos are rarely spread evenly, so contiguous index shards
+        # would leave some GPUs with nothing to do. Split the pending list into equal
+        # chunks instead and hand each GPU the index window spanning its chunk — the
+        # finished videos caught inside a window cost nothing, since the workers drop
+        # them too (they get --skip_existing as well).
+        out_dir = inference_output_dir(cfg["experiment_name"], video_type, root=REPO_ROOT)
+        done = completed_output_names(out_dir)
+        pending = [i for i in range(win_start, win_end) if output_name_for(cond_paths[i]) not in done]
+        if not pending:
+            print(f"every video in [{win_start}, {win_end}) already has a prediction in {out_dir}; nothing to do.")
+            return
+        chunks = even_shards(0, len(pending), len(gpus))
+        shards = [(pending[lo], pending[hi - 1] + 1) for lo, hi in chunks]
+        # what each worker actually samples, which is fewer than its window spans
+        shard_counts = [hi - lo for lo, hi in chunks]
+    else:
+        shards = even_shards(win_start, win_end, len(gpus))
+        shard_counts = [hi - lo for lo, hi in shards]
     if not shards:
         raise SystemExit(f"nothing to do: window [{win_start}, {win_end}) is empty")
 
@@ -190,11 +222,13 @@ def main():
     print(f"video_type  : {video_type}")
     print(f"cond dir    : {cond_dir}  ({n_files} files)")
     print(f"window      : [{win_start}, {win_end})  ->  {win_end - win_start} videos")
+    if args.skip_existing:
+        print(f"skip_existing: {len(done)} prediction(s) in {out_dir}  ->  {len(pending)} left to sample")
     print(f"gpus        : {', '.join(gpus)}  ({len(shards)} worker(s))")
     print()
 
     procs = []
-    for idx, (gpu, (lo, hi)) in enumerate(zip(gpus, shards)):
+    for idx, (gpu, (lo, hi), n_todo) in enumerate(zip(gpus, shards, shard_counts)):
         cmd = [
             args.python, str(script_path),
             "--config", str(config_path),
@@ -220,13 +254,18 @@ def main():
             cmd += ["--ddim_start_t", str(args.ddim_start_t)]
         if args.seed is not None:
             cmd += ["--seed", str(args.seed)]
+        # The workers re-check the output folder themselves, which both skips the
+        # finished videos inside their window and keeps them honest if another run
+        # filled some in between this listing and their own start.
+        if args.skip_existing:
+            cmd += ["--skip_existing"]
         # Every worker calls save_config_snapshot on the SAME ./{experiment}/config.json.
         # Concurrently that races (one renames it to a backup, the rest hit
         # FileNotFoundError). Let only the first worker write it; the rest skip.
         if idx != 0:
             cmd += ["--no_config_snapshot"]
         env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu)
-        print(f"GPU {gpu}: videos [{lo}, {hi})  ({hi - lo})   CUDA_VISIBLE_DEVICES={gpu} {' '.join(cmd)}")
+        print(f"GPU {gpu}: videos [{lo}, {hi})  ({n_todo} to sample)   CUDA_VISIBLE_DEVICES={gpu} {' '.join(cmd)}")
         if not args.dry_run:
             procs.append((gpu, lo, hi, subprocess.Popen(cmd, env=env, cwd=str(REPO_ROOT))))
 

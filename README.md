@@ -130,6 +130,26 @@ Arguments:
 - `--start`, `--end`: index range for videos in the contour/mask folder (optional)
 - `--sampler`: `ddpm` (default) or `ddim`
 - `--ddim_steps`, `--ddim_eta`: DDIM step count and stochasticity (only used with `--sampler ddim`)
+- `--skip_existing`: skip videos already predicted in this experiment (resume a partial run)
+
+### Resuming a partial run
+
+Each video's prediction is saved under the output folder as `inference_disps/<name>.npy`,
+so re-running with `--skip_existing` samples only the videos that are still
+missing — the way to pick up after a job timeout, a crash, or Ctrl-C:
+
+```bash
+python inference.py --video_type cine --skip_existing
+
+# or across every GPU; the launcher splits only the missing videos between them
+python run_inference_multi_gpu.py --script inference_full_region.py --skip_existing
+```
+
+A prediction left truncated by a kill is detected and re-sampled. Existing files
+are never re-checked against the current settings, so start a fresh
+`experiment_name` (or delete the old files) when re-sampling with a different
+checkpoint, sampler, or seed. See
+[configs/README.md](configs/README.md#resuming-a-partial-run---skip_existing).
 
 ### Faster sampling with DDIM
 

@@ -134,6 +134,47 @@ CUDA_VISIBLE_DEVICES=3 python inference_full_region.py --start 99 --end 132 &
 wait
 ```
 
+### Resuming a partial run: `--skip_existing`
+
+Sampling writes one file per video to
+`./{experiment_name}/sampling_time_sampled_{video_type}_part_videos_infos/inference_disps/`,
+named after the condition file. That folder is therefore a record of what is
+already done, and `--skip_existing` uses it: any video whose prediction is
+already there is not sampled again. So a run killed by a job timeout, a crash,
+or Ctrl-C is resumed by re-running the same command with the flag added.
+
+```bash
+# single GPU
+python inference_full_region.py --skip_existing
+
+# all GPUs — only the missing videos, balanced across them
+python run_inference_multi_gpu.py --script inference_full_region.py --skip_existing
+```
+
+Details worth knowing:
+
+- **The multi-GPU launcher balances the remaining work, not the index range.**
+  Finished videos are rarely spread evenly after a partial run, so it splits the
+  *pending* list into equal chunks and gives each GPU the index window spanning
+  its chunk — every GPU gets the same amount of real sampling to do. Each worker
+  also gets `--skip_existing`, so the finished videos inside its window cost
+  nothing. `--dry_run` prints the resulting plan, including how many predictions
+  already exist and how many are left.
+- **A prediction truncated by a kill is re-sampled.** A file only counts as done
+  if its `.npy` header reads back and the file is as long as the header claims,
+  so the half-written file a crash leaves behind does not silently stay half
+  written.
+- **It matches on filename, not on how the sample was produced.** Existing
+  predictions are kept as they are, so do not use it to "fill in" a split whose
+  finished files came from a different checkpoint, sampler, or seed — for a
+  re-sample under new settings, point at a fresh `experiment_name` or delete the
+  stale files first.
+- **Only the `inference_disps/*.npy` prediction is checked**, not the
+  `quiver_plots/*.gif` preview: a skipped video keeps whatever gif the earlier
+  run wrote and gets no new one.
+- `skip_existing: true` in a config's `inference` block turns it on by default
+  for that config; the flag can only turn it on, never off.
+
 ## Config tracking
 
 On startup every script saves the config it was given to
@@ -588,6 +629,11 @@ a config snapshot to `./{experiment_name}/config.json`
 - `ddim_clip_percentile` — percentile for `"dynamic"` (default `0.995`).
 - `seed` — seeds the initial noise `x_T`; `null` (default) draws randomly. Needed
   to compare step counts fairly.
+- `skip_existing` — `false` (default). `true` skips every video that already has
+  a prediction in the experiment's `inference_disps/` folder, i.e. resumes a
+  partial run. `--skip_existing` also turns it on; unlike the other fields the
+  flag cannot turn it back off. See
+  [Resuming a partial run](#resuming-a-partial-run---skip_existing).
 
 ### Choosing a sampler
 Both samplers run the **same trained weights** — DDIM needs no retraining and no
