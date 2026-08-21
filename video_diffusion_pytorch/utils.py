@@ -17,7 +17,7 @@ def generate_displacement_quiver_gif(transformation_field, output_path, scale=1,
     Generates a GIF showing the displacement vectors across all frames without saving intermediate images.
 
     Parameters:
-    - transformation_field: displacement field (shape: (1, 2, 20, 48, 48)).
+    - transformation_field: displacement field (shape: (1, 2, 20, 64, 64)).
     - output_gif: Name of the output GIF file.
     - scale: Scaling factor for the quiver plot.
     - fps: Frames per second for the GIF.
@@ -27,8 +27,8 @@ def generate_displacement_quiver_gif(transformation_field, output_path, scale=1,
     )
 
     # Extract displacement components
-    displacement_x = data[0, 0]  # Shape: (20, 48, 48)
-    displacement_y = data[0, 1]  # Shape: (20, 48, 48)
+    displacement_x = data[0, 0]  # Shape: (20, 64, 64)
+    displacement_y = data[0, 1]  # Shape: (20, 64, 64)
 
     num_frames, h, w = displacement_x.shape
 
@@ -41,9 +41,12 @@ def generate_displacement_quiver_gif(transformation_field, output_path, scale=1,
             fig, ax = plt.subplots(figsize=(5, 5))
             ax.set_facecolor("black")  # Set background to black
             ax.set_aspect("equal")
+            ax.set_xlim(0, w)
+            ax.set_ylim(h, 0)  # image convention: row 0 at top
 
-            # Plot the displacement vectors
-            ax.quiver(x, y, displacement_x[frame_idx], displacement_y[frame_idx], color="y", scale=scale, units="xy")
+            # Plot the displacement vectors. Negate displacement_y to preserve
+            # direction after flipping the y-axis to image convention.
+            ax.quiver(x, y, displacement_x[frame_idx], -displacement_y[frame_idx], color="y", scale=scale, units="xy")
 
             # Add frame number text like "Frame: 5 / 20"
             ax.text(
@@ -122,8 +125,8 @@ def generate_displacement_quiver_gif_comparison(
     Generates a GIF showing the displacement vectors for two fields side by side across all frames.
 
     Parameters:
-    - transformation_field1: First displacement field (shape: (1, 2, 20, 48, 48)).
-    - transformation_field2: Second displacement field (shape: (1, 2, 20, 48, 48)).
+    - transformation_field1: First displacement field (shape: (1, 2, 20, 64, 64)).
+    - transformation_field2: Second displacement field (shape: (1, 2, 20, 64, 64)).
     - output_path: Path for the output GIF file.
     - scale: Scaling factor for the quiver plots.
     - fps: Frames per second for the GIF.
@@ -135,8 +138,8 @@ def generate_displacement_quiver_gif_comparison(
         if isinstance(transformation_field1, torch.Tensor)
         else transformation_field1
     )
-    displacement_x1 = data1[0, 0]  # Shape: (20, 48, 48)
-    displacement_y1 = data1[0, 1]  # Shape: (20, 48, 48)
+    displacement_x1 = data1[0, 0]  # Shape: (20, 64, 64)
+    displacement_y1 = data1[0, 1]  # Shape: (20, 64, 64)
 
     # Process field 2
     data2 = (
@@ -144,8 +147,8 @@ def generate_displacement_quiver_gif_comparison(
         if isinstance(transformation_field2, torch.Tensor)
         else transformation_field2
     )
-    displacement_x2 = data2[0, 0]  # Shape: (20, 48, 48)
-    displacement_y2 = data2[0, 1]  # Shape: (20, 48, 48)
+    displacement_x2 = data2[0, 0]  # Shape: (20, 64, 64)
+    displacement_y2 = data2[0, 1]  # Shape: (20, 64, 64)
 
     # Default titles if not provided
     if titles is None:
@@ -167,16 +170,19 @@ def generate_displacement_quiver_gif_comparison(
                 ax.set_facecolor("black")
                 ax.set_aspect("equal")
                 ax.axis("off")
+                ax.set_xlim(0, w)
+                ax.set_ylim(h, 0)  # image convention: row 0 at top
 
-            # Plot the first displacement field
+            # Plot the first displacement field. Negate displacement_y to
+            # preserve direction after flipping the y-axis to image convention.
             axs[0].quiver(
-                x, y, displacement_x1[frame_idx], displacement_y1[frame_idx], color="y", scale=scale, units="xy"
+                x, y, displacement_x1[frame_idx], -displacement_y1[frame_idx], color="y", scale=scale, units="xy"
             )
             axs[0].set_title(titles[0], color="white")
 
             # Plot the second displacement field
             axs[1].quiver(
-                x, y, displacement_x2[frame_idx], displacement_y2[frame_idx], color="y", scale=scale, units="xy"
+                x, y, displacement_x2[frame_idx], -displacement_y2[frame_idx], color="y", scale=scale, units="xy"
             )
             axs[1].set_title(titles[1], color="white")
 
@@ -247,10 +253,14 @@ def generate_displacement_quiver_gif_predicted_reconstructed_gt(
                 ax.set_facecolor("black")
                 ax.set_aspect("equal")
                 ax.axis("off")
+                ax.set_xlim(0, w)
+                ax.set_ylim(h, 0)  # image convention: row 0 at top
 
-            axs[0].quiver(x, y, dx1[t], dy1[t], color="y", scale=scale, units="xy")
-            axs[1].quiver(x, y, dx2[t], dy2[t], color="y", scale=scale, units="xy")
-            axs[2].quiver(x, y, dx3[t], dy3[t], color="y", scale=scale, units="xy")
+            # Negate displacement_y to preserve direction after flipping the
+            # y-axis to image convention.
+            axs[0].quiver(x, y, dx1[t], -dy1[t], color="y", scale=scale, units="xy")
+            axs[1].quiver(x, y, dx2[t], -dy2[t], color="y", scale=scale, units="xy")
+            axs[2].quiver(x, y, dx3[t], -dy3[t], color="y", scale=scale, units="xy")
 
             for i in range(3):
                 axs[i].set_title(titles[i], color="white")
@@ -313,7 +323,6 @@ def generate_mask_disp_side_by_side_gif(
     # Extract displacement components
     displacement_x = field_data[0, 0]  # Shape: (F, H, W)
     displacement_y = field_data[0, 1]  # Shape: (F, H, W)
-    displacement_y = -displacement_y
 
     # Get dimensions
     _, num_frames, height, width = video_data.shape
@@ -336,10 +345,13 @@ def generate_mask_disp_side_by_side_gif(
             # Plot 2: Displacement vectors
             ax2.set_facecolor("black")
             ax2.set_aspect("equal")
+            ax2.set_xlim(0, width)
+            ax2.set_ylim(height, 0)  # image convention: row 0 at top, matches the mask panel
+            # Negate displacement_y to preserve direction after flipping the
+            # y-axis to image convention.
             ax2.quiver(
-                x, y, displacement_x[frame_idx], displacement_y[frame_idx], color=quiver_color, scale=scale, units="xy"
+                x, y, displacement_x[frame_idx], -displacement_y[frame_idx], color=quiver_color, scale=scale, units="xy"
             )
-            ax2.invert_yaxis()
             ax2.set_title(field_title)
             # ax2.axis('off')
 
@@ -360,3 +372,115 @@ def generate_mask_disp_side_by_side_gif(
             writer.append_data(frame)
 
     print(f"side-by-side GIF saved as {output_path}")
+
+
+def generate_displacement_gridplot_gif(
+    transformation_field, output_path, fps=20, dpi=300, line_color="r", line_width=0.5, line_alpha=0.5, figsize=(2, 2)
+):
+    transformation_field_numpy = (
+        transformation_field.cpu().numpy() if isinstance(transformation_field, torch.Tensor) else transformation_field
+    )
+    # Extract dimensions
+    _, channels, frames, H, W = transformation_field_numpy.shape
+    assert channels == 2, "Expected 2 channels for x and y displacement"
+
+    # Create output directory if needed
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Create base grid points
+    x = np.linspace(0, W - 1, W)
+    y = np.linspace(0, H - 1, H)
+    X, Y = np.meshgrid(x, y)
+
+    # Set up the figure
+    fig = plt.figure(figsize=figsize)
+    plt.xticks([])
+    plt.yticks([])
+    plt.axis("off")
+    plt.subplots_adjust(top=1, bottom=0, left=0, right=1, hspace=0, wspace=0)
+    plt.margins(0, 0)
+
+    def update(frame):
+        plt.clf()
+        plt.xticks([])
+        plt.yticks([])
+        plt.axis("off")
+        plt.subplots_adjust(top=1, bottom=0, left=0, right=1, hspace=0, wspace=0)
+        plt.margins(0, 0)
+
+        # Get displacement for current frame
+        dx = transformation_field_numpy[0, 0, frame]
+        dy = transformation_field_numpy[0, 1, frame]
+
+        # Apply displacement
+        X_d = X + dx
+        Y_d = Y + dy
+
+        # Plot deformed grid
+        for i in range(W):
+            plt.plot(X_d[:, i], Y_d[:, i], f"{line_color}-", linewidth=line_width, alpha=line_alpha)
+        for i in range(H):
+            plt.plot(X_d[i, :], Y_d[i, :], f"{line_color}-", linewidth=line_width, alpha=line_alpha)
+
+        plt.axis("equal")
+        plt.gca().invert_yaxis()
+
+        return (fig,)
+
+    # Create animation
+    anim = FuncAnimation(fig, update, frames=frames, interval=1000 / fps, blit=True)
+
+    # Save as GIF
+    writer = PillowWriter(fps=fps)
+    anim.save(str(output_path), writer=writer, dpi=dpi)
+    plt.close()
+
+
+def generate_displacement_gridplot_gifs(milestone, displacement_field, output_dir, **kwargs):
+    """
+    Load displacement field from .npy file and create multiple GIFs.
+
+    Parameters:
+        displacement_field (str): displacement field (shape: [num_samples, 2, F, H, W])
+        output_dir (str): Directory where output GIFs will be saved
+        **kwargs: Additional arguments for generate_displacement_gridplot_gif
+    """
+    num_samples = displacement_field.shape[0]
+
+    # Create output directory if needed
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for i in range(num_samples):
+        output_path = output_dir / f"milestone_{milestone}_displacement_{i}.gif"
+        generate_displacement_gridplot_gif(displacement_field[i], output_path, **kwargs)
+
+
+def save_grayscale_videos(milestone, video_tensor, filenames, output_dir="./gt_videos", fps=10):
+    """
+    Saves grayscale videos as separate .gif files.
+
+    Args:
+        video_tensor (torch.Tensor or np.ndarray): Shape [num_samples, 1, F, H, W]
+        output_dir (str): Directory to save videos
+    """
+    if isinstance(video_tensor, torch.Tensor):
+        video_tensor = video_tensor.cpu().numpy()
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    num_samples, _, num_frames, height, width = video_tensor.shape
+
+    # Convert FPS to duration in milliseconds per frame
+    duration = math.ceil(1000 / fps)
+
+    # Process each sample
+    for sample_idx in range(num_samples):
+        frames = [Image.fromarray(video_tensor[sample_idx, 0, i]) for i in range(num_frames)]
+
+        # Define GIF filename
+        gif_filename = os.path.join(output_dir, f"milestone_{milestone}_gt_{filenames[sample_idx]}.gif")
+
+        # Save as GIF
+        frames[0].save(gif_filename, save_all=True, append_images=frames[1:], duration=duration, loop=0)
