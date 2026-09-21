@@ -13,7 +13,8 @@ inference_*.py scripts exactly as they run single-GPU.
 
     # auto-detect GPUs, run the default config across all of them
     python run_inference_multi_gpu.py --script inference_both_contour_motion_full_region.py --config configs/inference_both_contour_motion_full_region.json
-    python run_inference_multi_gpu.py --script inference_full_region.py
+    python run_inference_multi_gpu.py --script inference_both_contour_motion_full_region.py --config configs/inference_both_contour_motion_full_region_disp_norm.json
+    python run_inference_multi_gpu.py --script inference_full_region.py --config configs/inference_full_region.json
     python run_inference_multi_gpu.py --script inference_full_region.py --config configs/inference_augmented.json
     python run_inference_multi_gpu.py --script inference_full_region.py --config configs/inference_group_dro.json
     
@@ -55,6 +56,7 @@ from video_diffusion_pytorch.completed_outputs import (
 COND_DIR_RULE = {
     "inference.py": "contour_template",
     "inference_full_region.py": "contour_template",
+    "inference_label_cond.py": "contour_template",
     "inference_both_contour_motion.py": "contour_template",
     "inference_both_contour_motion_full_region.py": "contour_template",
     "inference_only_motion.py": "motion_template",
@@ -73,6 +75,10 @@ def parse_args():
     parser.add_argument("--video_type", type=str, default=None,
                         help="override video_type for every worker (else the config's value)")
     parser.add_argument("--milestone", type=int, default=None, help="override checkpoint milestone for every worker")
+    parser.add_argument("--label_mode", type=str, default=None,
+                        help="label-conditioned scripts only: full / level_only / none (else the config's value)")
+    parser.add_argument("--cond_scale", type=float, default=None,
+                        help="label-conditioned scripts only: classifier-free guidance scale (1.0 = off)")
     parser.add_argument("--sampler", type=str, default=None, choices=["ddpm", "ddim"],
                         help="override the sampler for every worker (else the config's value, default ddpm)")
     parser.add_argument("--ddim_steps", type=int, default=None,
@@ -158,12 +164,23 @@ def main():
     script_path = REPO_ROOT / script_name
     if not script_path.exists():
         raise SystemExit(f"script not found: {script_path}")
+    # Label flags exist only on the label-conditioned worker; the others would
+    # die on an unknown argument after being launched.
+    if script_name != "inference_label_cond.py" and (args.label_mode is not None or args.cond_scale is not None):
+        raise SystemExit(f"--label_mode/--cond_scale only apply to inference_label_cond.py, not {script_name}")
 
     config_path = args.config if args.config is not None else default_config_for(script_name)
     if not config_path.exists():
         raise SystemExit(f"config not found: {config_path}")
     with config_path.open() as f:
         cfg = json.load(f)
+
+    # The label-cond configs carry a templated experiment_name ("...-rot{rot_w}").
+    # The workers resolve it themselves; we must too, or --skip_existing would look
+    # for finished predictions under the literal "{rot_w}" folder and find none.
+    if "{" in cfg.get("experiment_name", ""):
+        from train_label_cond import resolve_experiment_name
+        resolve_experiment_name(cfg)
 
     infer_cfg = cfg.get("inference", {})
     # Resolve video_type exactly like the worker: CLI > config > "cine".
@@ -238,6 +255,11 @@ def main():
         ]
         if args.milestone is not None:
             cmd += ["--milestone", str(args.milestone)]
+        # Only inference_label_cond.py accepts these (validated above).
+        if args.label_mode is not None:
+            cmd += ["--label_mode", args.label_mode]
+        if args.cond_scale is not None:
+            cmd += ["--cond_scale", str(args.cond_scale)]
         if args.sampler is not None:
             cmd += ["--sampler", args.sampler]
         if args.ddim_steps is not None:

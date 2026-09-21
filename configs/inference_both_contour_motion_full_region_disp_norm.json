@@ -1,5 +1,5 @@
 {
-    "experiment_name": "new-data-noise-full-region-cond-mask-motion-both-disp-norm",
+    "experiment_name": "proposal-26-frames-cond-mask-motion-both-ddp-scale-2-step-1000-disp-norm",
     "data": {
         "base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames",
         "input_video_subdir": "dense/train/displacement_dense",
@@ -28,7 +28,7 @@
         "channels": 2,
         "timesteps": 1000,
         "loss_type": "l2",
-        "disp_scale": 5.0,
+        "disp_scale": 2.0,
         "contour_noise_only": false,
         "disp_metrics": true,
         "loss_disp_normalize": true,

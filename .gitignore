@@ -20,6 +20,7 @@ MR*
 *.slurm
 config*.json
 *.env
+UVA-MotionNet/
 
 # Distribution / packaging
 .Python

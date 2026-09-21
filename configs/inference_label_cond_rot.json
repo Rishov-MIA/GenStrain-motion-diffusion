@@ -1,5 +1,5 @@
 {
-    "experiment_name": "proposal-26frames-extended-data-all-disease",
+    "experiment_name": "proposal-26frames-label-cond-rot{rot_w}",
     "data": {
         "base_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames",
         "input_video_subdir": "dense/train/displacement_dense",
@@ -10,14 +10,9 @@
     },
     "model": {
         "dim": 48,
-        "cond_dim": null,
+        "cond_dim": 64,
         "channels": 2,
-        "dim_mults": [
-            1,
-            2,
-            4,
-            8
-        ]
+        "dim_mults": [1, 2, 4, 8]
     },
     "diffusion": {
         "image_size": 64,
@@ -26,7 +21,14 @@
         "timesteps": 1000,
         "loss_type": "l2",
         "disp_scale": 5.0,
-        "contour_noise_only": false
+        "contour_noise_only": true,
+        "rotation_loss_weight": 0.2
+    },
+    "labels": {
+        "metadata_json": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/processed_excel.json",
+        "null_cond_prob": 0.2,
+        "null_label_prob": 0.15,
+        "use_site": false
     },
     "training": {
         "batch_size": 8,
@@ -37,9 +39,24 @@
         "amp": true,
         "save_and_sample_every": 300
     },
+    "frame_validity": {
+        "dense": {
+            "csv_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames/frame_counts_test.csv",
+            "filename_col": "dense_filename",
+            "valid_frames_col": "dense_valid_frames"
+        },
+        "cine": {
+            "csv_path": "/scratch/vst2hb/Dataset_Processing/Data Bank/proposal-genstrain-new/all_data_resampled_26_frames/frame_counts_test.csv",
+            "filename_col": "cine_filename",
+            "valid_frames_col": "cine_valid_frames"
+        }
+    },
     "inference": {
         "milestone": -1,
-        "video_type": "cine",
+        "video_type": "dense",
+        "label_mode": "level_only",
+        "cond_scale": 1.0,
+        "n_samples": 1,
         "start": 0,
         "end": null,
         "sampler": "ddpm",
@@ -49,6 +66,9 @@
         "ddim_clip_x_start": null,
         "ddim_clip_percentile": 0.995,
         "ddim_start_t": null,
-        "seed": null
+        "seed": null,
+        "zero_frame0": true,
+        "zero_invalid_frames": true,
+        "skip_existing": false
     }
 }

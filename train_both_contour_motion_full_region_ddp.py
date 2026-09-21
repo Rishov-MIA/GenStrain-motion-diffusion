@@ -10,7 +10,7 @@ for what each field means. Launch with torchrun. Example for 4 GPUs on one node:
 
 For 2 GPUs, with a custom config:
 
-    torchrun --standalone --nproc_per_node=2 train_both_contour_motion_full_region_ddp.py --config configs/my_experiment_ddp.json
+    torchrun --standalone --nproc_per_node=4 train_both_contour_motion_full_region_ddp.py --config configs/train_both_contour_motion_full_region_disp_norm_ddp.json
 
 NOTE: `training.per_gpu_batch_size` is PER-GPU. With N GPUs the effective global
 batch size is `per_gpu_batch_size * N`. The single-GPU script used a global batch

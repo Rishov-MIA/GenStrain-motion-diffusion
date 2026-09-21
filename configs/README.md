@@ -566,6 +566,71 @@ difference from the other trainers — worth noting if you compare a
 frame-masked inverse-frequency run against a frame-masked Group-DRO one. With
 `csv_path: null` (the shipped default) the two are identical.
 
+### `labels` (label-conditioned runs only)
+
+Used by `train_label_cond.py` / `inference_label_cond.py`
+(`video_diffusion_pytorch/label_cond.py`). On top of the mask video, the UNet
+is conditioned on three categorical labels — disease group, slice level
+(apex/mid/base) and site — each through its own embedding table with a learned
+null row, concatenated to the timestep embedding via the `model.cond_dim` path.
+Set `model.cond_dim` to the total embedding width (64 is the default config).
+
+| field | meaning |
+|---|---|
+| `metadata_json` | `processed_excel.json`: per-slice `disease` / `site`. Keys are matched by filename with the `_cycleN` / `_scale_x` suffixes stripped (same rule as Group-DRO). |
+| `null_cond_prob` | whole-sample classifier-free dropout: probability that a training sample's labels are all replaced by the null rows together (0.2). Trains the unconditional path (`label_mode: none`). |
+| `null_label_prob` | per-label independent dropout applied after the whole-sample one (0.15). Trains the partial combinations, in particular `level_only` (disease null, slice level kept), which is the deployment default and would otherwise never occur in training. With 0.2 / 0.15 roughly 64% of samples train fully labelled, 20% unconditional, and 10% in the level_only combination. |
+| `use_site` | also embed the acquisition site (true). Disease and site are confounded (every LBBB case is UVA), so keeping site as its own label stops the disease embedding from becoming a site embedding. |
+| `preview_mode` | labels given to the training-time preview samples: `full`, `level_only` or `none`. |
+
+Disease groups (first match wins; anything else is `Other`): LBBB-scar, LBBB,
+Healthy, DCM, MI, HF, Myocarditis. The vocabulary lives in
+`video_diffusion_pytorch/label_metadata.py` and is stamped into every
+checkpoint; loading under a different vocabulary raises.
+
+The `experiment_name` of these configs may carry placeholders filled from the
+config at startup (same convention as Group-DRO's `{eta_q}`), so each ablation
+setting writes to its own folder and wandb run: `{rot_w}` rotation loss
+weight, `{snr_clip}`, `{cno}` contour_noise_only as 0/1, `{cond_dim}`,
+`{null_p}`, `{label_p}`, `{site}` use_site as 0/1, `{bs}` batch size (per GPU
+under DDP). The default is `proposal-26frames-label-cond-rot{rot_w}`. The
+inference config resolves the same template from its own values, so keep the
+placeholder fields identical between the training and inference configs.
+
+Two extra `diffusion` fields, read only by the label-conditioned scripts:
+
+| field | meaning |
+|---|---|
+| `rotation_loss_weight` | weight of the rotation-curve auxiliary loss (0.0 = off, the default; the objective is then the plain eps-loss). Adds L1 between the per-frame bulk rotation of the single-step x0 estimate and of the ground truth over the frame-0 myocardium, the same rotation curve `scripts/twist_metrics.py` scores. Each sample's term is weighted by min(SNR_t, `rotation_loss_snr_clip`), so it vanishes at high noise where x0 is unreliable. Curves are in degrees, so with clip 5 the weighted term is O(5 x degrees of error); 0.01 is a sensible first weight. |
+| `rotation_loss_snr_clip` | the min-SNR clip for that weighting (5.0). |
+
+`rotation_mae_deg` (mean |theta_pred - theta_gt| over valid frames) and
+`gt_rotation_abs_deg` (mean |theta_gt|, so the two can be read as a ratio) are
+logged with the other displacement metrics whenever `disp_metrics` is on,
+loss or no loss. They are single-step x0 estimates at random t, so trend
+indicators only; authoritative numbers come from `scripts/twist_metrics.py`.
+
+Inference adds to the `inference` block:
+
+| field | meaning |
+|---|---|
+| `label_mode` | `full` (disease + level + site from the metadata), `level_only` (slice level from the filename, disease/site null — the deployment default, no diagnosis needed) or `none` (all null: the unconditional path, i.e. the mask-only model). |
+| `cond_scale` | classifier-free guidance scale; 1.0 = plain conditional pass, >1 amplifies the label's effect. No effect under `label_mode: none`. Try 1.0 and 1.5. |
+| `n_samples` | samples per condition video; k>0 are written as `<name>_s<k>.npy` (seed + k when a seed is given). For LBBB/DCM report the median rotation curve over samples, not one draw. |
+| `zero_frame0` | zero the sampled frame-0 field (true). Lagrangian displacement is zero there by definition; anything else is pure error under `epe_disp_rel`. |
+| `zero_invalid_frames` | zero frames past the valid count from `frame_validity.<video_type>.csv_path` (true). |
+
+`frame_validity` in the inference config is keyed by video type
+(`"dense": {...}, "cine": {...}`), each with `csv_path` / `filename_col` /
+`valid_frames_col`.
+
+Training: `train_label_cond.py` (single GPU, `training.batch_size`) or
+`train_label_cond_ddp.py` under torchrun (`training.per_gpu_batch_size`,
+`data.num_workers`, optional `data.sampling_base_path`, same as the other DDP
+scripts). Their checkpoints are interchangeable. Inference is single GPU per
+worker; `run_inference_multi_gpu.py --script inference_label_cond.py` shards it
+across GPUs the same way as the others.
+
 ### `logging` (optional)
 Weights & Biases loss monitoring. The whole block is optional — omit it and
 logging stays off (the code defaults to `use_wandb=false`). Console per-step
